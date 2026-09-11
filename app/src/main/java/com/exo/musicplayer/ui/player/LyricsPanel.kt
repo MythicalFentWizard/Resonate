@@ -44,6 +44,7 @@ import androidx.compose.ui.unit.dp
 import com.exo.musicplayer.data.db.Lyrics
 import com.exo.musicplayer.data.lyrics.LrcParser
 import com.exo.musicplayer.data.lyrics.LyricLine
+import com.exo.musicplayer.ui.theme.LocalLyricsColors
 
 @Composable
 fun LyricsPanel(
@@ -175,9 +176,9 @@ private fun SyncedLyrics(
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
                 color = if (isActive) {
-                    MaterialTheme.colorScheme.primary
+                    LocalLyricsColors.current.active ?: MaterialTheme.colorScheme.primary
                 } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
+                    LocalLyricsColors.current.inactive ?: MaterialTheme.colorScheme.onSurfaceVariant
                 },
                 modifier = Modifier
                     .fillMaxWidth()

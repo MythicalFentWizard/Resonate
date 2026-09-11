@@ -235,6 +235,7 @@ fun PlaylistDetailScreen(
     onAddToQueue: (Track) -> Unit,
     onToggleFavorite: (Track) -> Unit,
     onFixTags: (Track) -> Unit,
+    onEditDetails: (Track) -> Unit,
     onRemoveFromPlaylist: (Track) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -285,6 +286,7 @@ fun PlaylistDetailScreen(
                         onAddToPlaylist = { },
                         onToggleFavorite = { onToggleFavorite(track) },
                         onFixTags = { onFixTags(track) },
+                                onEditDetails = { onEditDetails(track) },
                         onDelete = { onRemoveFromPlaylist(track) },
                         deleteLabel = "Remove from playlist"
                     )

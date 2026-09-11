@@ -56,6 +56,7 @@ fun MoodsScreen(
     onAddToPlaylist: (Track) -> Unit,
     onToggleFavorite: (Track) -> Unit,
     onFixTags: (Track) -> Unit,
+    onEditDetails: (Track) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(modifier.fillMaxSize()) {
@@ -178,6 +179,7 @@ fun MoodsScreen(
                                 onAddToPlaylist = { onAddToPlaylist(track) },
                                 onToggleFavorite = { onToggleFavorite(track) },
                                 onFixTags = { onFixTags(track) },
+                                onEditDetails = { onEditDetails(track) },
                                 onDelete = { }
                             )
                             state.affinities[track.id]?.let { affinity ->

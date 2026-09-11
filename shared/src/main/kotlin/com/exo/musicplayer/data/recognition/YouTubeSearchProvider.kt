@@ -1,84 +1,58 @@
 package com.exo.musicplayer.data.recognition
 
-import com.exo.musicplayer.data.net.Http
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import java.net.URLEncoder
+import com.exo.musicplayer.data.youtube.PipedYouTubeBackend
+import com.exo.musicplayer.data.youtube.YouTubeBackend
 
 /**
- * Searches YouTube without an API key, via Piped.
+ * YouTube as one voice in the catalogue chain.
  *
- * Piped is a privacy front-end that exposes a plain JSON search endpoint, so no
- * Google API key, quota or billing account is involved. Deliberately *not* done
- * with yt-dlp: yt-dlp's Android binding maps a single video and cannot return a
- * result list, and shelling out to it for every keystroke would be slow. This is
- * one HTTP call, it lives in the shared module, and Windows gets it unchanged.
+ * This is the thin adapter that lets a YouTube hit sit in a list of catalogue
+ * matches for the by-name search. The dedicated YouTube tab does not go through
+ * here — it keeps the results as [com.exo.musicplayer.data.youtube.YouTubeVideo]
+ * so it can show view counts, upload dates and thumbnails, none of which fit in
+ * a [MusicMatch].
  *
- * What comes back is a real watch URL, which is then handed to yt-dlp to
- * download — search and download stay separate concerns.
+ * Two things about the previous version of this file were wrong and are worth
+ * recording, because both were load-bearing beliefs:
  *
- * Public instances come and go constantly, so several are tried in turn and the
- * first that answers wins. If every one is down, YouTube rows are simply absent
- * from the results rather than the whole search failing.
+ * It searched with `filter=music_songs`, on the assumption that the YouTube
+ * Music index would be cleaner for a music player. Measured against the live
+ * endpoint, that filter returns rows with `views: -1`, `uploadedDate: null` and
+ * `shortDescription: null` — no view counts, no dates, no descriptions, and a
+ * 120 px square thumbnail. The ordinary video search returns all of it, and the
+ * results are the ones a person would recognise. `filter=videos` it is.
+ *
+ * It also claimed yt-dlp could not be used because its Android binding "maps a
+ * single video and cannot return a result list". The binding exposes
+ * `execute(request)`, which returns the process stdout, so
+ * `ytsearchN:query --flat-playlist -J` works on a phone exactly as it does on a
+ * desktop. That is now the fallback backend in the YouTube tab; it is not used
+ * here only because spawning a Python runtime for one voice in a seven-service
+ * parallel search would make every by-name search wait on the slowest member.
  */
-class YouTubeSearchProvider : MetadataProvider {
+class YouTubeSearchProvider(
+    private val backend: YouTubeBackend = PipedYouTubeBackend()
+) : MetadataProvider {
 
     override val label = "YouTube"
 
     override suspend fun search(query: String, limit: Int): List<MusicMatch> =
-        withContext(Dispatchers.IO) {
-            val encoded = URLEncoder.encode(query, "UTF-8")
-            for (instance in INSTANCES) {
-                val body = Http.get(
-                    "$instance/search?q=$encoded&filter=music_songs",
-                    mapOf("Accept" to "application/json")
-                ) ?: continue
-
-                val parsed = parse(body, limit)
-                if (parsed.isNotEmpty()) return@withContext parsed
-            }
-            emptyList()
-        }
-
-    private fun parse(body: String, limit: Int): List<MusicMatch> = runCatching {
-        val items = JSONObject(body).optJSONArray("items") ?: return emptyList()
-        (0 until minOf(items.length(), limit)).mapNotNull { index ->
-            val item = items.optJSONObject(index) ?: return@mapNotNull null
-            if (item.optString("type") !in setOf("stream", "video")) return@mapNotNull null
-
-            val title = item.optString("title").takeIf { it.isNotBlank() }
-                ?: return@mapNotNull null
-            // Piped returns a site-relative path like "/watch?v=ID".
-            val path = item.optString("url").takeIf { it.isNotBlank() }
-                ?: return@mapNotNull null
-            val videoId = path.substringAfter("v=", "").substringBefore('&')
-            if (videoId.isBlank()) return@mapNotNull null
-
+        backend.search(query, limit).map { video ->
             MusicMatch(
-                title = title,
-                artist = item.optString("uploaderName").takeIf { it.isNotBlank() },
+                title = video.title,
+                // The channel, not an artist. Presented as one because a
+                // MusicMatch has nowhere else to put it, and for the great
+                // majority of music uploads it is the artist or their label —
+                // but it is why the ranker scores these rows on the title.
+                artist = video.channel,
                 album = null,
-                artworkUrl = item.optString("thumbnail").takeIf { it.isNotBlank() },
-                durationMs = item.optLong("duration", 0L).takeIf { it > 0 }?.times(1000),
+                artworkUrl = video.thumbnail(),
+                durationMs = video.durationSeconds?.times(1000L),
                 source = MusicMatch.Source.SEARCH,
                 provider = label,
-                // Canonical youtube.com URL rather than the Piped proxy, so
-                // yt-dlp fetches from the source.
-                downloadUrl = "https://www.youtube.com/watch?v=$videoId"
+                // A real watch URL, so the downloader fetches this exact video
+                // rather than searching by name for something similar.
+                downloadUrl = video.watchUrl
             )
         }
-    }.getOrDefault(emptyList())
-
-    private companion object {
-        /** Verified reachable at time of writing; they rot, hence the fallback. */
-        val INSTANCES = listOf(
-            "https://api.piped.private.coffee",
-            "https://pipedapi.kavin.rocks",
-            "https://pipedapi.drgns.space",
-            "https://piped-api.lunar.icu",
-            "https://pipedapi.reallyaweso.me",
-            "https://pipedapi.adminforge.de"
-        )
-    }
 }

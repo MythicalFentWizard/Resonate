@@ -30,6 +30,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.exo.musicplayer.BuildConfig
 
 @Composable
 fun SettingsScreen(
@@ -85,7 +86,7 @@ fun SettingsScreen(
 
         Spacer(Modifier.height(36.dp))
         Text(
-            text = "Resonate\nmade by lucent",
+            text = "Resonate ${BuildConfig.VERSION_NAME}\nmade by lucent",
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,

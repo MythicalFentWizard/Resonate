@@ -3,20 +3,53 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Beamed eighth notes, centred in the 72dp adaptive-icon safe zone. -->
-    <path
-        android:fillColor="#7DD3FC"
-        android:pathData="M44,32.5 L74,26.5 A1.5,1.5 0 0 1 76,28 L76,36 A1.5,1.5 0 0 1 74.7,37.5 L44,43.5 Z" />
-    <path
-        android:fillColor="#7DD3FC"
-        android:pathData="M41,32 L45,32 L45,66 L41,66 Z" />
-    <path
-        android:fillColor="#7DD3FC"
-        android:pathData="M72,26 L76,26 L76,60 L72,60 Z" />
-    <path
-        android:fillColor="#38BDF8"
-        android:pathData="M43,58m-9,0a9,7.5 0 1,0 18,0a9,7.5 0 1,0 -18,0" />
-    <path
-        android:fillColor="#38BDF8"
-        android:pathData="M74,52m-9,0a9,7.5 0 1,0 18,0a9,7.5 0 1,0 -18,0" />
+
+    <!--
+        Beamed eighth notes.
+
+        The paths below are drawn where they were originally authored, with a
+        bounding box of x 34..83 and y 26..66 — so their centre lands at
+        (58.5, 46) rather than the canvas centre of (54, 54), which is why the
+        launcher icon sat high and to the right.
+
+        Rather than shifting every coordinate by hand, the group corrects it:
+        scaled 1.10x about the glyph's own centre, then translated by
+        (-4.5, +8) to bring that centre onto the canvas centre. Using a group
+        matters because it scales the elliptical arc radii of the noteheads
+        too, which editing the path data by hand would quietly get wrong.
+
+        After the transform the ink spans x 27..81 and y 32..76, centred on
+        (54, 54), entirely inside the 66dp guaranteed-safe zone (21..87). The
+        furthest point of ink sits 30.9 from the centre against the 72dp
+        visible circle's radius of 36 — measured on the notehead curves rather
+        than their bounding boxes, whose corners hold no ink.
+    -->
+    <group
+        android:pivotX="58.5"
+        android:pivotY="46"
+        android:scaleX="1.10"
+        android:scaleY="1.10"
+        android:translateX="-4.5"
+        android:translateY="8">
+
+        <!-- Beam joining the two stems. -->
+        <path
+            android:fillColor="#7DD3FC"
+            android:pathData="M44,32.5 L74,26.5 A1.5,1.5 0 0 1 76,28 L76,36 A1.5,1.5 0 0 1 74.7,37.5 L44,43.5 Z" />
+        <!-- Left stem. -->
+        <path
+            android:fillColor="#7DD3FC"
+            android:pathData="M41,32 L45,32 L45,66 L41,66 Z" />
+        <!-- Right stem. -->
+        <path
+            android:fillColor="#7DD3FC"
+            android:pathData="M72,26 L76,26 L76,60 L72,60 Z" />
+        <!-- Noteheads, tilted ellipses. -->
+        <path
+            android:fillColor="#38BDF8"
+            android:pathData="M43,58m-9,0a9,7.5 0 1,0 18,0a9,7.5 0 1,0 -18,0" />
+        <path
+            android:fillColor="#38BDF8"
+            android:pathData="M74,52m-9,0a9,7.5 0 1,0 18,0a9,7.5 0 1,0 -18,0" />
+    </group>
 </vector>

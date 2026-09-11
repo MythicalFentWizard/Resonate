@@ -25,7 +25,7 @@ object FileSampler {
         val rate = AudioDevices.FORMAT.sampleRate.toInt()
         val wantedFrames = seconds * rate
 
-        Decoder(file).use { decoder ->
+        Decoder.open(file).use { decoder ->
             // Half-way in, but never so far that less than a full window is left.
             val startFrame = if (durationMs > seconds * 1000L) {
                 val midpoint = (durationMs / 2) * rate / 1000
@@ -35,11 +35,9 @@ object FileSampler {
                 0L
             }
 
-            var skipped = 0L
-            while (skipped < startFrame) {
-                val chunk = decoder.read(minOf(16384L, startFrame - skipped).toInt()) ?: break
-                skipped += chunk.size / 2
-            }
+            // Skipped rather than read: reading converted and resampled every frame
+            // on the way to the middle of the track, only to throw it away.
+            decoder.skip(startFrame)
 
             val mono = FloatArray(wantedFrames)
             var filled = 0

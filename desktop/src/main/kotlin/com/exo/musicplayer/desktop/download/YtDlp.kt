@@ -2,10 +2,31 @@ package com.exo.musicplayer.desktop.download
 
 import com.exo.musicplayer.data.download.DownloadQuality
 import com.exo.musicplayer.desktop.data.AppDirs
+import com.exo.musicplayer.desktop.data.NetworkProxy
 import com.exo.musicplayer.desktop.data.ToolPaths
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+
+/**
+ * Passed to every yt-dlp call. Many VPNs carry only IPv4, and yt-dlp trying
+ * IPv6 first behind one fails outright; tunnels also stall, so the socket
+ * timeout is longer than yt-dlp's 20 s.
+ */
+internal val YT_DLP_NETWORK = listOf("--force-ipv4", "--socket-timeout", "30")
+
+/**
+ * Downloads only: a flaky tunnel drops connections mid-file, and yt-dlp's
+ * retries otherwise fire back to back and are all spent within the same
+ * second. These back off, so a short dropout is ridden out. Kept off search,
+ * where waiting half a minute to report failure would be worse.
+ */
+internal val YT_DLP_RETRIES = listOf(
+    "--extractor-retries", "5",
+    "--retry-sleep", "exp=1:20",
+    "--retry-sleep", "fragment:exp=1:20",
+    "--retry-sleep", "extractor:exp=1:10"
+)
 
 /** What the downloader can do right now. */
 data class ToolStatus(
@@ -65,8 +86,9 @@ object YtDlp {
             val exe = ToolPaths.makeUpdatable("yt-dlp.exe")
                 ?: error("Couldn't find yt-dlp to update.")
             onLine("Updating ${exe.absolutePath}")
-            val process = ProcessBuilder(exe.absolutePath, "-U")
+            val process = ProcessBuilder(listOf(exe.absolutePath, "-U") + NetworkProxy.ytDlpArgs())
                 .redirectErrorStream(true)
+                .also(NetworkProxy::configure)
                 .start()
             process.inputStream.bufferedReader().forEachLine(onLine)
             check(process.waitFor() == 0) { "Update failed." }
@@ -123,9 +145,14 @@ object YtDlp {
                     command += "--embed-metadata"
                     if (embedThumbnail) command += "--embed-thumbnail"
                 }
+                command += NetworkProxy.ytDlpArgs()
+                command += YT_DLP_NETWORK
+                command += YT_DLP_RETRIES
                 command += target
 
-                val process = ProcessBuilder(command).redirectErrorStream(true).start()
+                val process = ProcessBuilder(command).redirectErrorStream(true)
+                    .also(NetworkProxy::configure)
+                    .start()
                 registerProcess(process)
                 process.inputStream.bufferedReader().forEachLine { line ->
                     onProgress(DownloadProgress(percentOf(line), line.trim()))
@@ -171,7 +198,10 @@ object YtDlp {
                     command += listOf("--ffmpeg", ToolPaths.ffmpeg.absolutePath)
                 }
 
-                val process = ProcessBuilder(command).redirectErrorStream(true).start()
+                // spotdl has no SOCKS option of its own; it gets the environment.
+                val process = ProcessBuilder(command).redirectErrorStream(true)
+                    .also(NetworkProxy::configure)
+                    .start()
                 registerProcess(process)
                 process.inputStream.bufferedReader().forEachLine { line ->
                     onProgress(DownloadProgress(null, line.trim()))

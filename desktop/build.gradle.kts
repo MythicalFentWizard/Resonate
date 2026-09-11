@@ -6,6 +6,10 @@ plugins {
     alias(libs.plugins.compose.multiplatform)
 }
 
+// Read from gradle.properties rather than written here, so the desktop
+// installer and the APK can never disagree about which release they are.
+val resonateVersion = providers.gradleProperty("resonateVersion").get()
+
 // Targets Java 17 bytecode using whichever JDK is running, rather than
 // demanding a JDK 17 toolchain be installed. :app consumes this module and
 // Android rejects class files newer than 17.
@@ -59,6 +63,11 @@ compose.desktop {
         // set, or traffic is already routed at the adapter, it changes nothing.
         jvmArgs("-Djava.net.useSystemProxies=true")
 
+        // The About panel reads this back. Baking it in at package time means
+        // the number on screen is the number the installer registered with
+        // Windows, rather than a second copy that can drift.
+        jvmArgs("-Dresonate.version=$resonateVersion")
+
         // Memory behaviour, deliberately without -Xmx.
         //
         // A hard heap cap is the usual way to make a JVM look small, and it is
@@ -106,7 +115,12 @@ compose.desktop {
                 "jdk.crypto.ec",    // elliptic-curve TLS: most of the APIs need it
                 "jdk.unsupported"   // sun.misc.Unsafe, used by the audio SPIs
             )
-            packageVersion = "1.0.0"
+            // Drives the MSI ProductVersion, which is the whole of Windows'
+            // upgrade logic: it has to increase for an installer to replace an
+            // existing install instead of offering to remove it. jpackage
+            // derives a fresh ProductCode from name plus version, so bumping
+            // this is also what makes the new build a distinct product.
+            packageVersion = resonateVersion
             windows {
                 menuGroup = "Resonate"
                 shortcut = true
@@ -115,4 +129,39 @@ compose.desktop {
             }
         }
     }
+}
+
+// ---- MSI upgrade repair ----------------------------------------------------
+//
+// jpackage sequences RemoveExistingProducts at 798, which WiX's own validator
+// rejects (ICE27) because that is the search phase, not the execution phase.
+// Left alone, the previous version is uninstalled outside the install
+// transaction: nothing rolls it back if the new install then fails. The fix is
+// one integer in the sequence table, applied to whatever jpackage just wrote.
+//
+// Wired with finalizedBy rather than folded into tools/build.sh so that a
+// plain `gradle packageMsi` produces a correct installer too - an installer
+// that is only correct when built through one particular script is a trap.
+val fixMsiUpgradeSequence by tasks.registering(Exec::class) {
+    description = "Moves RemoveExistingProducts into the MSI execution phase (ICE27)."
+    // The MSI is rewritten in place, so there is nothing to be up to date about.
+    outputs.upToDateWhen { false }
+
+    // Both the debug and release packaging tasks are swept; the script ignores
+    // directories that do not exist, so one call covers whichever ran.
+    val msiDirs = listOf("main", "main-release").map {
+        layout.buildDirectory.dir("compose/binaries/$it/msi").get().asFile.absolutePath
+    }
+    commandLine(
+        listOf(
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+            rootProject.layout.projectDirectory.file("tools/fix-msi-upgrade.ps1")
+                .asFile.absolutePath,
+            "-MsiDir", msiDirs.joinToString(";")
+        )
+    )
+}
+
+listOf("packageMsi", "packageReleaseMsi").forEach { name ->
+    tasks.matching { it.name == name }.configureEach { finalizedBy(fixMsiUpgradeSequence) }
 }

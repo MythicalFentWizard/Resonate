@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Paths the FileProvider may hand out as content:// URIs.
+
+    Imported tracks live in app-specific external storage when it is available
+    and in internal storage when it is not, so both roots are listed - the
+    importer picks at runtime and sharing must work either way.
+
+    Deliberately narrow: only the two directories Resonate writes audio and
+    artwork into. A provider rooted at "." would expose the whole data
+    directory, including the database, to anything holding a granted URI.
+-->
+<paths>
+    <!-- getExternalFilesDir(DIRECTORY_MUSIC) -->
+    <external-files-path name="imported_music" path="Music/" />
+    <!-- filesDir/Music, the fallback when there is no external storage -->
+    <files-path name="internal_music" path="Music/" />
+    <!-- Extracted cover art, for sharing artwork alongside a track -->
+    <files-path name="artwork" path="art/" />
+    <!-- Zip archives, so "zip and ship" can hand one straight to another app -->
+    <external-files-path name="archives" path="archives/" />
+    <files-path name="internal_archives" path="archives/" />
+</paths>

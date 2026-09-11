@@ -1,5 +1,7 @@
 package com.exo.musicplayer.playback
 
+import com.exo.musicplayer.data.audio.EffectPreset
+
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
@@ -68,46 +70,41 @@ data class AudioFxState(
 }
 
 /** One-tap combinations. Every slider stays adjustable afterwards. */
-enum class FxPreset(val label: String, val state: AudioFxState) {
-    NORMAL("Normal", AudioFxState()),
+/**
+ * The preset list, taken from [EffectPreset] so Android and Windows cannot
+ * offer different sets — which is exactly what had happened.
+ *
+ * Only the reverb mapping is platform-specific: Android's hardware effect takes
+ * a named room, so the shared abstract room size is bucketed onto one.
+ */
+enum class FxPreset(val preset: EffectPreset) {
+    NORMAL(EffectPreset.NORMAL),
+    SLOWED(EffectPreset.SLOWED),
+    SLOWED_REVERB(EffectPreset.SLOWED_REVERB),
+    SPED_UP(EffectPreset.SPED_UP),
+    NIGHTCORE(EffectPreset.NIGHTCORE),
+    DEEP(EffectPreset.DEEP),
+    CAVERN(EffectPreset.CAVERN);
 
-    /** The familiar "slowed + reverb" edit: a touch under tempo, pitch follows. */
-    SLOWED(
-        "Slowed",
-        AudioFxState(speed = 0.85f, pitchSemitones = -1.5f)
-    ),
+    val label: String get() = preset.label
+    val note: String get() = preset.note
 
-    SLOWED_REVERB(
-        "Slowed + reverb",
-        AudioFxState(
-            speed = 0.82f,
-            pitchSemitones = -2f,
-            reverbEnabled = true,
-            reverbRoom = ReverbRoom.HALL,
-            reverbAmount = 0.55f
+    val state: AudioFxState
+        get() = AudioFxState(
+            speed = preset.speed,
+            pitchSemitones = preset.pitchSemitones,
+            reverbEnabled = preset.reverb,
+            reverbRoom = roomFor(preset.roomSize),
+            reverbAmount = preset.reverbAmount
         )
-    ),
 
-    SPED_UP(
-        "Sped up",
-        AudioFxState(speed = 1.25f, pitchSemitones = 1.5f)
-    ),
-
-    /** Nightcore: fast and clearly pitched up. */
-    NIGHTCORE(
-        "Nightcore",
-        AudioFxState(speed = 1.3f, pitchSemitones = 4f)
-    ),
-
-    /** Tempo change with the original key preserved. */
-    DEEP(
-        "Deep",
-        AudioFxState(
-            speed = 0.92f,
-            pitchSemitones = -4f,
-            reverbEnabled = true,
-            reverbRoom = ReverbRoom.CATHEDRAL,
-            reverbAmount = 0.45f
-        )
-    )
+    private companion object {
+        /** Buckets the shared 0..1 room size onto the nearest hardware room. */
+        fun roomFor(size: Float): ReverbRoom = when {
+            size < 0.35f -> ReverbRoom.ROOM
+            size < 0.6f -> ReverbRoom.PLATE
+            size < 0.85f -> ReverbRoom.HALL
+            else -> ReverbRoom.CATHEDRAL
+        }
+    }
 }

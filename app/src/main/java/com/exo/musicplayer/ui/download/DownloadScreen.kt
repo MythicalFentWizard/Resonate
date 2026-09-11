@@ -81,9 +81,10 @@ fun DownloadScreen(
         }
 
         Text(
-            text = "Paste a YouTube, SoundCloud or Bandcamp link and Resonate pulls " +
-                "the audio out as an mp3, tags it, and adds it to your library. " +
-                "Spotify links work too, by matching the track elsewhere.",
+            text = "Paste a YouTube, SoundCloud or Bandcamp link, or just type an artist " +
+                "and song name and Resonate finds the song on YouTube first. Either way " +
+                "the audio arrives as an mp3, tagged and added to your library. Spotify " +
+                "links work too, by finding the same track.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
@@ -98,7 +99,7 @@ fun DownloadScreen(
             OutlinedTextField(
                 value = url,
                 onValueChange = onUrlChange,
-                placeholder = { Text("https://…") },
+                placeholder = { Text("Link, or artist and song name") },
                 singleLine = true,
                 enabled = !state.busy,
                 shape = MaterialTheme.shapes.large,
@@ -113,11 +114,14 @@ fun DownloadScreen(
             }
         }
 
-        Row(
+        // A Column, not a Row. These used to be siblings in a Row whose first
+        // child was itself fillMaxWidth, which took the entire width and pushed
+        // the Download button off the right-hand edge - present in the tree,
+        // laid out past the screen, invisible.
+        Column(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(horizontal = 16.dp)
         ) {
             // Quality is a short ladder, not a slider: sites serve a few
             // fixed renditions and anything finer would be a fiction.
@@ -140,18 +144,23 @@ fun DownloadScreen(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Spacer(Modifier.height(8.dp))
-            Button(
-                onClick = onDownload,
-                enabled = !state.busy && url.isNotBlank(),
-                modifier = Modifier.weight(1f)
+            Spacer(Modifier.height(10.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Icon(Icons.Default.Download, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Download")
-            }
-            if (state.busy) {
-                OutlinedButton(onClick = onCancel) { Text("Stop") }
+                Button(
+                    onClick = onDownload,
+                    enabled = !state.busy && url.isNotBlank(),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Default.Download, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Download")
+                }
+                if (state.busy) {
+                    OutlinedButton(onClick = onCancel) { Text("Stop") }
+                }
             }
         }
 
@@ -166,6 +175,14 @@ fun DownloadScreen(
                     .padding(horizontal = 16.dp)
             ) {
                 Column(Modifier.padding(16.dp)) {
+                    if (state.queueSize > 1) {
+                        Text(
+                            "Song ${state.queuePosition} of ${state.queueSize}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(Modifier.height(8.dp))
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.width(12.dp))
@@ -190,22 +207,22 @@ fun DownloadScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                    state.note?.let {
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            text = it,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
                     state.title?.let {
                         Spacer(Modifier.height(8.dp))
                         Text(
                             text = it,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    state.note?.let {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = it,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
                         )
                     }
                 }
@@ -234,7 +251,7 @@ fun DownloadScreen(
                             MaterialTheme.colorScheme.onPrimaryContainer
                         }
                     )
-                    if (state.isError) {
+                    if (state.isError && state.offerUpdate) {
                         Spacer(Modifier.height(8.dp))
                         TextButton(onClick = onUpdate) {
                             Icon(Icons.Default.Update, null, Modifier.size(16.dp))
@@ -248,9 +265,11 @@ fun DownloadScreen(
 
         Spacer(Modifier.height(16.dp))
         Text(
-            text = "Spotify itself can't be downloaded from: its audio is DRM " +
-                "protected, so a Spotify link is matched by name instead — check the " +
-                "result is the version you wanted.\n\n" +
+            text = "A song name is found on YouTube before anything downloads: the " +
+                "original upload is picked over sped-up, slowed, cover and live " +
+                "versions, and if none of the results is the song, nothing is saved. " +
+                "Spotify links are matched the same way, since Spotify's own audio is " +
+                "DRM protected.\n\n" +
                 "yt-dlp is bundled and runs entirely on your phone — nothing is " +
                 "sent to a server. YouTube changes often break it; the update button " +
                 "above fetches a newer yt-dlp without reinstalling the app.",

@@ -195,7 +195,8 @@ fun PlayerScreen(
                         selectedOutputs = selectedOutputs,
                         mirrorOutputs = mirrorOutputs,
                         onPickOutput = onPickOutput,
-                        onMirrorOutputs = onMirrorOutputs
+                        onMirrorOutputs = onMirrorOutputs,
+                        playing = state.isPlaying
                     )
                 } else if (showLyrics) {
                     LyricsPanel(

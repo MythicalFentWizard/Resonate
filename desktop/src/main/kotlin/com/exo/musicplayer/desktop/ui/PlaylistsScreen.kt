@@ -28,6 +28,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Album
+import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.Save
@@ -324,6 +325,12 @@ private fun OpenPlaylist(
                 Spacer(Modifier.width(8.dp))
                 GhostButton("Rename") { renaming = true }
                 Spacer(Modifier.width(8.dp))
+                GhostButton(
+                    "Zip and ship",
+                    enabled = !controller.archiveRunning,
+                    icon = Icons.Default.Archive
+                ) { controller.zipPlaylist(playlist) }
+                Spacer(Modifier.width(8.dp))
                 GhostButton("Export…", icon = Icons.Default.Save) {
                     onPickPlaylistFile(true, playlist.name)?.let {
                         controller.exportPlaylist(playlist, it)
@@ -431,93 +438,5 @@ private fun PlaylistTrackRow(
                 Icon(Icons.Default.Delete, "Remove", Modifier.size(13.dp), tint = Palette.TextDim)
             }
         }
-    }
-}
-
-/** Albums: covers first, because that is how people actually look for an album. */
-@Composable
-fun AlbumsScreen(controller: DesktopController) {
-    val albums = remember(controller.tracks) {
-        controller.tracks
-            .filter { !it.album.isNullOrBlank() }
-            .groupBy { "${it.displayAlbum}|${it.displayArtist}" }
-            .map { (_, group) ->
-                val ordered = group.sortedBy { it.trackNumber ?: Int.MAX_VALUE }
-                ordered.first().displayAlbum to ordered
-            }
-            .sortedBy { it.first.lowercase() }
-    }
-
-    if (albums.isEmpty()) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            EmptyState(
-                icon = Icons.Default.Album,
-                title = "No albums",
-                body = "Nothing in the library has an album tag yet.\n" +
-                    "Run Names & tags from the library toolbar to fill them in."
-            )
-        }
-        return
-    }
-
-    LazyVerticalGrid(
-        columns = GridCells.Adaptive(160.dp),
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-        modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp)
-    ) {
-        items(albums, key = { it.first + it.second.first().displayArtist }) { (name, group) ->
-            AlbumCard(name, group) { controller.play(group.first(), group) }
-        }
-    }
-}
-
-@Composable
-private fun AlbumCard(name: String, tracks: List<DesktopTrack>, onPlay: () -> Unit) {
-    val interaction = remember { MutableInteractionSource() }
-    val hovered by interaction.collectIsHoveredAsState()
-
-    Column(
-        Modifier
-            .clip(RoundedCornerShape(9.dp))
-            .background(if (hovered) Palette.Hover else Color.Transparent)
-            .hoverable(interaction)
-            .clickable(onClick = onPlay)
-            .padding(8.dp)
-    ) {
-        Box {
-            Artwork(tracks.first(), 144.dp, corner = 7.dp, modifier = Modifier.fillMaxWidth())
-            if (hovered) {
-                Box(
-                    Modifier
-                        .padding(8.dp)
-                        .size(30.dp)
-                        .clip(RoundedCornerShape(15.dp))
-                        .background(Palette.Accent)
-                        .align(Alignment.BottomEnd),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        Icons.Default.PlayArrow, "Play",
-                        Modifier.size(16.dp), tint = Palette.OnAccent
-                    )
-                }
-            }
-        }
-        Spacer(Modifier.height(9.dp))
-        Text(
-            name,
-            style = MaterialTheme.typography.bodyMedium,
-            color = Palette.Text,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        Text(
-            "${tracks.first().displayArtist} · ${tracks.size} tracks",
-            style = MaterialTheme.typography.labelSmall,
-            color = Palette.TextFaint,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
     }
 }

@@ -50,7 +50,7 @@ import com.exo.musicplayer.desktop.library.DesktopTrack
 import com.exo.musicplayer.util.asDuration
 
 /** Which modal is open, if any. */
-enum class DialogKind { BULK, DUPLICATES, ADD_TO_PLAYLIST }
+enum class DialogKind { BULK, DUPLICATES, ADD_TO_PLAYLIST, MERGE }
 
 /**
  * Modal surface.
@@ -152,16 +152,16 @@ fun BulkToolsDialog(controller: DesktopController, onDismiss: () -> Unit) {
             BulkOption(
                 kind = BulkKind.COVERS,
                 icon = Icons.Default.Album,
-                description = "Finds missing cover art across seven catalogues. " +
-                    "Tracks that already have art are left alone.",
+                description = "Finds missing cover art, five songs at a time, asking six " +
+                    "sources at once, YouTube first. Tracks that already have art are left alone.",
                 enabled = !job.running
             ) { controller.runBulk(BulkKind.COVERS, redo) }
 
             BulkOption(
                 kind = BulkKind.TAGS,
                 icon = Icons.AutoMirrored.Filled.Label,
-                description = "Looks each track up by name and fills in artist, " +
-                    "album and year.",
+                description = "Looks songs up by name, five at a time, and fills in artist, " +
+                    "album and year, each from the best source that has it.",
                 enabled = !job.running
             ) { controller.runBulk(BulkKind.TAGS, redo) }
 
@@ -484,4 +484,88 @@ fun AddToPlaylistDialog(
             }
         }
     }
+}
+
+/**
+ * Hand-edit a track's details.
+ *
+ * Identification gets it right most of the time and not all of it — live
+ * bootlegs, uncatalogued tracks, names the services transliterate differently.
+ * Emptying a box clears that tag rather than leaving the old value, because
+ * deleting a wrong album name has to be possible.
+ */
+@Composable
+fun EditTrackDialog(
+    controller: DesktopController,
+    track: DesktopTrack,
+    onDismiss: () -> Unit
+) {
+    var title by remember(track.file.absolutePath) { mutableStateOf(track.title) }
+    var artist by remember(track.file.absolutePath) { mutableStateOf(track.artist.orEmpty()) }
+    var album by remember(track.file.absolutePath) { mutableStateOf(track.album.orEmpty()) }
+    var year by remember(track.file.absolutePath) {
+        mutableStateOf(track.year?.toString().orEmpty())
+    }
+
+    ScrimDialog(title = "Edit details", subtitle = track.file.name, onDismiss = onDismiss) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Artwork(track, 76.dp, corner = 8.dp)
+            Spacer(Modifier.width(16.dp))
+            Column(Modifier.weight(1f)) {
+                FieldLabel("Song name")
+                TextInput(title, { title = it }, "Required", Modifier.fillMaxWidth())
+                Spacer(Modifier.height(10.dp))
+                FieldLabel("Artist")
+                TextInput(artist, { artist = it }, "Unknown artist", Modifier.fillMaxWidth())
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        Row {
+            Column(Modifier.weight(2f)) {
+                FieldLabel("Album")
+                TextInput(album, { album = it }, "None", Modifier.fillMaxWidth())
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.width(96.dp)) {
+                FieldLabel("Year")
+                TextInput(year, { year = it.filter(Char::isDigit).take(4) }, "----",
+                    Modifier.fillMaxWidth())
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        Hint(
+            if (controller.writeTags) {
+                "Saved into the file's own tags, so other players see it too."
+            } else {
+                "\"Write tags into files\" is off in Settings, so this will not be saved " +
+                    "to the file. Turn it on first."
+            }
+        )
+        controller.editNote?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(it, style = MaterialTheme.typography.bodySmall, color = Palette.Accent)
+        }
+
+        Spacer(Modifier.height(16.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Spacer(Modifier.weight(1f))
+            GhostButton("Cancel", onClick = onDismiss)
+            Spacer(Modifier.width(8.dp))
+            AccentButton("Save", enabled = controller.writeTags) {
+                controller.saveTrackDetails(track, title, artist, album, year)
+            }
+        }
+    }
+}
+
+@Composable
+private fun FieldLabel(text: String) {
+    Text(
+        text.uppercase(),
+        style = MaterialTheme.typography.labelSmall,
+        color = Palette.TextFaint,
+        modifier = Modifier.padding(bottom = 4.dp)
+    )
 }

@@ -6,6 +6,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.exo.musicplayer.data.db.HourBucket
 import com.exo.musicplayer.data.db.Lyrics
+import com.exo.musicplayer.data.archive.ArchiveEntry
+import com.exo.musicplayer.data.archive.MusicArchive
 import com.exo.musicplayer.data.db.PlaylistSummary
 import com.exo.musicplayer.data.playlist.ImportResult as PlaylistImport
 import com.exo.musicplayer.data.playlist.PlaylistEntry
@@ -21,6 +23,7 @@ import com.exo.musicplayer.data.lyrics.LyricLine
 import com.exo.musicplayer.data.lyrics.LyricsFetch
 import com.exo.musicplayer.data.ingest.ImportResult
 import com.exo.musicplayer.data.recognition.AudioSampler
+import com.exo.musicplayer.data.recognition.AudiusProvider
 import com.exo.musicplayer.data.recognition.DeezerProvider
 import com.exo.musicplayer.data.recognition.GeniusMetadataProvider
 import com.exo.musicplayer.data.recognition.ITunesProvider
@@ -28,6 +31,7 @@ import com.exo.musicplayer.data.recognition.MetadataProviderChain
 import com.exo.musicplayer.data.recognition.MusicBrainzProvider
 import com.exo.musicplayer.data.recognition.MusicMatch
 import com.exo.musicplayer.data.recognition.RecognitionResult
+import com.exo.musicplayer.data.recognition.YouTubeSearchProvider
 import com.exo.musicplayer.data.repo.SortMode
 import com.exo.musicplayer.data.weather.Affinity
 import com.exo.musicplayer.data.weather.WeatherAffinity
@@ -43,6 +47,8 @@ import com.exo.musicplayer.playback.ReverbRoom
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -85,12 +91,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val started = SharingStarted.WhileSubscribed(5_000)
 
+    // The same sources and order as the Windows cover tool: YouTube first, then
+    // the stores and free catalogues, MusicBrainz last.
     private val coverSearch = MetadataProviderChain(
         listOf(
+            YouTubeSearchProvider(),
             ITunesProvider(),
             DeezerProvider(),
-            MusicBrainzProvider(),
-            GeniusMetadataProvider()
+            AudiusProvider(),
+            GeniusMetadataProvider(),
+            MusicBrainzProvider()
         )
     )
 
@@ -367,15 +377,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * fingerprinting: a fingerprint costs a decode plus a network round trip per
      * song, which on a large library is minutes of work for art a title lookup
      * already finds.
+     *
+     * Five songs at a time, each asking every catalogue at once, as on Windows;
+     * a dead image link moves on to the next catalogue's picture.
      */
-    fun updateAllCovers(redo: Boolean = false) = runBulk("cover") { track ->
-        val query = listOfNotNull(track.artist, track.title).joinToString(" ")
-        val art = runCatching { coverSearch.searchForArtwork(query) }.getOrNull()
-        val ok = art != null &&
-            runCatching { library.updateArtwork(track, art) }.getOrDefault(false)
-        library.markArtChecked(track.id)
-        ok
-    }
+    fun updateAllCovers(redo: Boolean = false) =
+        runBulk("cover", redo, parallel = 5) { track ->
+            val query = listOfNotNull(track.artist, track.title).joinToString(" ")
+            val ok = runCatching {
+                coverSearch.findArtwork(query) { url ->
+                    library.updateArtwork(track, url).takeIf { it }
+                }
+            }.getOrNull() == true
+            library.markArtChecked(track.id)
+            ok
+        }
 
     /**
      * Fingerprints every track and rewrites its tags from what comes back.
@@ -400,7 +416,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Fetches lyrics for the whole library through the four-tier chain. */
-    fun fetchAllLyrics(redo: Boolean = false) = runBulk("lyrics", redo) { track ->
+    fun fetchAllLyrics(redo: Boolean = false) = runBulk("lyrics", redo, parallel = 5) { track ->
         val found = runCatching { app.lyrics.fetch(track, force = redo) }
             .getOrNull() is LyricsFetch.Found
         library.markLyricsChecked(track.id)
@@ -417,6 +433,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun runBulk(
         kind: String,
         redo: Boolean = false,
+        parallel: Int = 1,
         work: suspend (Track) -> Boolean
     ) {
         bulkJob?.cancel()
@@ -434,19 +451,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
+            var finished = 0
             var done = 0
             var failed = 0
+            val queue = Channel<Track>(Channel.UNLIMITED)
+            targets.forEach { queue.trySend(it) }
+            queue.close()
             _bulk.value = BulkProgress(total = targets.size)
-            for ((index, track) in targets.withIndex()) {
-                if (!isActive) return@launch
-                _bulk.value = BulkProgress(
-                    done = index,
-                    total = targets.size,
-                    added = done,
-                    failed = failed,
-                    currentName = track.title
-                )
-                if (runCatching { work(track) }.getOrDefault(false)) done++ else failed++
+            // Workers share the main thread between suspensions, so the counters
+            // need no locking.
+            coroutineScope {
+                repeat(parallel) {
+                    launch {
+                        for (track in queue) {
+                            _bulk.value = BulkProgress(
+                                done = finished,
+                                total = targets.size,
+                                added = done,
+                                failed = failed,
+                                currentName = track.title
+                            )
+                            if (runCatching { work(track) }.getOrDefault(false)) done++ else failed++
+                            finished++
+                        }
+                    }
+                }
             }
 
             _bulk.value = null
@@ -683,6 +712,189 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deletePlaylist(playlistId: Long) = viewModelScope.launch {
         library.deletePlaylist(playlistId)
+    }
+
+    // ---- Editing a track by hand ----
+
+    private val _editTarget = MutableStateFlow<Track?>(null)
+    val editTarget: StateFlow<Track?> = _editTarget.asStateFlow()
+
+    fun editTrack(track: Track) { _editTarget.value = track }
+
+    fun dismissEdit() { _editTarget.value = null }
+
+    fun saveTrackDetails(
+        track: Track,
+        title: String,
+        artist: String,
+        album: String,
+        year: Int?
+    ) {
+        _editTarget.value = null
+        viewModelScope.launch {
+            runCatching { library.saveDetails(track, title, artist, album, year) }
+        }
+    }
+
+    // ---- Zip and ship ----
+    //
+    // Packs the library or a playlist into one file, reports where it landed,
+    // and can hand it straight to another app. Written into the app's own
+    // external files directory, which needs no storage permission on any API
+    // level and is still a real path a file manager can reach.
+
+    data class ArchiveState(
+        val running: Boolean = false,
+        val fraction: Float = 0f,
+        val current: String = "",
+        val note: String? = null,
+        val file: File? = null
+    )
+
+    private val _archive = MutableStateFlow(ArchiveState())
+    val archive: StateFlow<ArchiveState> = _archive.asStateFlow()
+
+    @Volatile private var archiveCancelled = false
+
+    fun zipLibrary() = startArchive("Library") { library.allTracks() }
+
+    fun zipPlaylist(playlist: PlaylistSummary) =
+        startArchive(playlist.name) { library.playlistTracksOnce(playlist.id) }
+
+    fun zipSelected(visible: List<Track>) {
+        val chosen = selectedTracks(visible)
+        clearSelection()
+        startArchive("Selection") { chosen }
+    }
+
+    private fun startArchive(label: String, load: suspend () -> List<Track>) {
+        if (_archive.value.running) return
+        archiveCancelled = false
+        _archive.value = ArchiveState(running = true)
+
+        viewModelScope.launch {
+            val chosen = runCatching { load() }.getOrDefault(emptyList())
+            if (chosen.isEmpty()) {
+                _archive.value = ArchiveState(note = "Nothing to archive.")
+                return@launch
+            }
+
+            val context = getApplication<Application>()
+            val root = context.getExternalFilesDir(null) ?: context.filesDir
+            val stamp = java.time.LocalDate.now().toString()
+            val destination = File(
+                File(root, "archives"),
+                MusicArchive.safeName("Resonate $label $stamp") + ".zip"
+            )
+
+            // Numbered so a playlist keeps its order once unpacked, and named
+            // with the artist so the folder is navigable rather than a wall of
+            // identical-looking files.
+            val digits = chosen.size.toString().length
+            val entries = chosen.mapIndexed { index, track ->
+                val file = File(track.filePath)
+                val number = (index + 1).toString().padStart(digits, '0')
+                val stem = listOfNotNull(
+                    track.artist?.takeIf { it.isNotBlank() }, track.title
+                ).joinToString(" - ")
+                ArchiveEntry(file, "$number ${MusicArchive.safeName(stem)}.${file.extension}")
+            }
+
+            val result = withContext(Dispatchers.IO) {
+                MusicArchive.zip(
+                    entries = entries,
+                    destination = destination,
+                    onProgress = { progress ->
+                        _archive.value = _archive.value.copy(
+                            fraction = progress.fraction,
+                            current = progress.currentName
+                        )
+                    },
+                    shouldContinue = { !archiveCancelled }
+                )
+            }
+
+            _archive.value = result.fold(
+                onSuccess = { done ->
+                    ArchiveState(
+                        note = buildString {
+                            append("${done.included} tracks, ")
+                            append("%.1f MB".format(done.bytes / 1_048_576.0))
+                            if (done.skipped.isNotEmpty()) {
+                                append(" - ${done.skipped.size} missing from storage")
+                            }
+                        },
+                        file = done.file
+                    )
+                },
+                onFailure = {
+                    ArchiveState(note = it.message ?: "Couldn't build the archive.")
+                }
+            )
+        }
+    }
+
+    fun cancelArchive() {
+        archiveCancelled = true
+        _archive.value = ArchiveState(note = "Cancelled.")
+    }
+
+    fun dismissArchive() { _archive.value = ArchiveState() }
+
+    // ---- Selecting several tracks ----
+    //
+    // Held as a set of ids rather than of Tracks: the list is re-queried
+    // constantly as playback counts and favourites change, so holding entities
+    // would keep stale copies and break equality against the fresh ones.
+
+    private val _selectedIds = MutableStateFlow<Set<Long>>(emptySet())
+    val selectedIds: StateFlow<Set<Long>> = _selectedIds.asStateFlow()
+
+    val selectionMode: StateFlow<Boolean> =
+        _selectedIds.map { it.isNotEmpty() }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    fun toggleSelected(trackId: Long) {
+        _selectedIds.value = _selectedIds.value.let {
+            if (trackId in it) it - trackId else it + trackId
+        }
+    }
+
+    fun clearSelection() { _selectedIds.value = emptySet() }
+
+    fun selectAll(tracks: List<Track>) {
+        _selectedIds.value = tracks.map { it.id }.toSet()
+    }
+
+    /** Resolves the selection to tracks, in the order they appear on screen. */
+    fun selectedTracks(visible: List<Track>): List<Track> {
+        val chosen = _selectedIds.value
+        return visible.filter { it.id in chosen }
+    }
+
+    fun favoriteSelected(visible: List<Track>) = viewModelScope.launch {
+        val chosen = selectedTracks(visible)
+        // One decision for the whole selection: if any are not favourites,
+        // favourite everything. Toggling each independently would leave a
+        // mixed selection mixed, which is never what was meant.
+        val makeFavorite = chosen.any { !it.isFavorite }
+        for (track in chosen) {
+            if (track.isFavorite != makeFavorite) library.setFavorite(track.id, makeFavorite)
+        }
+        clearSelection()
+    }
+
+    fun addSelectedToPlaylist(playlistId: Long, visible: List<Track>) =
+        viewModelScope.launch {
+            library.addToPlaylist(playlistId, selectedTracks(visible).map { it.id })
+            clearSelection()
+        }
+
+    fun deleteSelected(visible: List<Track>) = viewModelScope.launch {
+        for (track in selectedTracks(visible)) {
+            runCatching { library.deleteTrack(track) }
+        }
+        clearSelection()
     }
 
     // ---- Sharing playlists ----

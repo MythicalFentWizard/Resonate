@@ -36,12 +36,14 @@ import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.ui.unit.dp
 import androidx.compose.material3.AlertDialog
@@ -64,8 +66,10 @@ import com.exo.musicplayer.ui.MoodState
 import com.exo.musicplayer.ui.common.AddToPlaylistDialog
 import com.exo.musicplayer.ui.common.BulkImportDialog
 import com.exo.musicplayer.ui.common.DuplicatesDialog
+import com.exo.musicplayer.ui.common.EditTrackDialog
 import com.exo.musicplayer.ui.common.FixTagsDialog
 import com.exo.musicplayer.ui.common.LibraryToolsDialog
+import com.exo.musicplayer.ui.download.DownloadRequest
 import com.exo.musicplayer.ui.download.DownloadScreen
 import com.exo.musicplayer.ui.download.DownloadViewModel
 import com.exo.musicplayer.ui.library.LibraryScreen
@@ -73,6 +77,7 @@ import com.exo.musicplayer.ui.moods.MoodsScreen
 import com.exo.musicplayer.ui.player.MiniPlayer
 import com.exo.musicplayer.ui.player.PlayerScreen
 import com.exo.musicplayer.ui.playlists.PlaylistDetailScreen
+import com.exo.musicplayer.share.ShareTracks
 import com.exo.musicplayer.ui.playlists.PlaylistsScreen
 import com.exo.musicplayer.ui.recognition.RecognitionScreen
 import com.exo.musicplayer.ui.recognition.RecognitionViewModel
@@ -82,7 +87,9 @@ import com.exo.musicplayer.ui.settings.SettingsScreen
 import com.exo.musicplayer.ui.settings.SoundScreen
 import com.exo.musicplayer.ui.splash.SplashScreen
 import com.exo.musicplayer.ui.theme.LocalStarfieldActive
+import com.exo.musicplayer.ui.theme.LocalStarsVisible
 import com.exo.musicplayer.ui.theme.MusicPlayerTheme
+import com.exo.musicplayer.ui.theme.ScreenBackdrop
 import com.exo.musicplayer.ui.theme.Starfield
 import kotlinx.coroutines.delay
 import com.exo.musicplayer.ui.theme.ThemeSettings
@@ -196,6 +203,9 @@ private fun AppScaffold(
     val sort by viewModel.sort.collectAsStateWithLifecycle()
     val playlists by viewModel.playlists.collectAsStateWithLifecycle()
     val playlistNote by viewModel.playlistNote.collectAsStateWithLifecycle()
+    val selectedIds by viewModel.selectedIds.collectAsStateWithLifecycle()
+    val archiveState by viewModel.archive.collectAsStateWithLifecycle()
+    var selectionForPlaylist by remember { mutableStateOf<List<Track>>(emptyList()) }
     val playlistImport by viewModel.importResult.collectAsStateWithLifecycle()
     val state by viewModel.playbackState.collectAsStateWithLifecycle()
     val currentTrackId by viewModel.currentTrackId.collectAsStateWithLifecycle()
@@ -209,6 +219,7 @@ private fun AppScaffold(
     val favorites by viewModel.favorites.collectAsStateWithLifecycle()
     val mood by viewModel.mood.collectAsStateWithLifecycle()
     val notice by viewModel.notice.collectAsStateWithLifecycle()
+    val editTarget by viewModel.editTarget.collectAsStateWithLifecycle()
     val tagTarget by viewModel.tagTarget.collectAsStateWithLifecycle()
     val tagBusy by viewModel.tagBusy.collectAsStateWithLifecycle()
     val tagResult by viewModel.tagResult.collectAsStateWithLifecycle()
@@ -373,7 +384,13 @@ private fun AppScaffold(
                 .padding(padding)
         ) {
             when (tab) {
-                Tab.LIBRARY -> LibraryScreen(
+                Tab.LIBRARY -> {
+                // Selection actions operate on what is on screen, which is the
+                // search results while a query is active and the full library
+                // otherwise - selecting a search result and then acting on the
+                // unfiltered list would hit the wrong tracks.
+                val visibleTracks = if (query.isNotBlank()) results else tracks
+                LibraryScreen(
                     tracks = tracks,
                     searchResults = results,
                     query = query,
@@ -395,8 +412,36 @@ private fun AppScaffold(
                     onAddToPlaylist = { addingToPlaylist = it },
                     onToggleFavorite = { viewModel.toggleFavorite(it) },
                     onFixTags = { viewModel.startFixTags(it) },
-                    onDelete = { viewModel.deleteTrack(it) }
+                    onEditDetails = { viewModel.editTrack(it) },
+                    onDelete = { viewModel.deleteTrack(it) },
+                    selectedIds = selectedIds,
+                    onToggleSelect = { viewModel.toggleSelected(it.id) },
+                    onClearSelection = viewModel::clearSelection,
+                    onSelectAll = { viewModel.selectAll(visibleTracks) },
+                    onShareSelected = {
+                        val chosen = viewModel.selectedTracks(visibleTracks)
+                        val intent = ShareTracks.intentFor(context, chosen)
+                        if (intent == null) {
+                            Toast.makeText(
+                                context,
+                                "Those files are missing from storage.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        } else {
+                            context.startActivity(
+                                Intent.createChooser(
+                                    intent,
+                                    if (chosen.size == 1) "Share song" else "Share ${chosen.size} songs"
+                                )
+                            )
+                            viewModel.clearSelection()
+                        }
+                    },
+                    onPlaylistSelected = { selectionForPlaylist = viewModel.selectedTracks(visibleTracks) },
+                    onFavoriteSelected = { viewModel.favoriteSelected(visibleTracks) },
+                    onDeleteSelected = { viewModel.deleteSelected(visibleTracks) }
                 )
+                }
 
                 Tab.IDENTIFY -> {
                     val stage by recognition.stage.collectAsStateWithLifecycle()
@@ -405,12 +450,22 @@ private fun AppScaffold(
                     val label by recognition.sourceLabel.collectAsStateWithLifecycle()
                     val rmode by recognition.mode.collectAsStateWithLifecycle()
 
+                    val rartist by recognition.artist.collectAsStateWithLifecycle()
+                    val rtitle by recognition.title.collectAsStateWithLifecycle()
+                    val youtubeResults by recognition.youtubeResults.collectAsStateWithLifecycle()
+                    val youtubeStatus by recognition.youtubeStatus.collectAsStateWithLifecycle()
+                    val preview by recognition.preview.state.collectAsStateWithLifecycle()
+
                     RecognitionScreen(
                         stage = stage,
                         result = result,
                         query = rquery,
                         sourceLabel = label,
                         onQueryChange = recognition::setQuery,
+                        artist = rartist,
+                        onArtistChange = recognition::setArtist,
+                        title = rtitle,
+                        onTitleChange = recognition::setTitle,
                         onSearch = recognition::runSearch,
                         mode = rmode,
                         onModeChange = recognition::setMode,
@@ -421,11 +476,41 @@ private fun AppScaffold(
                             tab = Tab.LIBRARY
                         },
                         onDownload = { match ->
+                            // The match's own fields rather than a joined-up
+                            // string, so the YouTube finder can check the title,
+                            // the artist and the length separately.
                             download.downloadMatch(
                                 downloadUrl = match.downloadUrl,
-                                query = listOfNotNull(match.artist, match.title)
-                                    .joinToString(" ")
+                                artist = match.artist,
+                                title = match.title,
+                                durationMs = match.durationMs
                             )
+                            showDownload = true
+                        },
+                        youtubeResults = youtubeResults,
+                        youtubeStatus = youtubeStatus,
+                        preview = preview,
+                        onPreviewYouTube = recognition::previewYouTube,
+                        onDownloadYouTube = { video ->
+                            // A real watch URL, so this takes the direct path
+                            // rather than the search-by-name fallback.
+                            download.downloadMatch(
+                                downloadUrl = video.watchUrl,
+                                artist = null,
+                                title = video.title,
+                                durationMs = null
+                            )
+                            // The preview would otherwise keep playing over the
+                            // download screen it just opened.
+                            recognition.stopPreview()
+                            showDownload = true
+                        },
+                        onDownloadMany = { matches, videos ->
+                            download.downloadAll(
+                                matches.map { DownloadRequest(it.downloadUrl, it.artist, it.title, it.durationMs) } +
+                                    videos.map { DownloadRequest(it.watchUrl, null, it.title, null) }
+                            )
+                            recognition.stopPreview()
                             showDownload = true
                         },
                         onCopy = { match ->
@@ -451,7 +536,8 @@ private fun AppScaffold(
                     onAddToQueue = viewModel::addToQueue,
                     onAddToPlaylist = { addingToPlaylist = it },
                     onToggleFavorite = { viewModel.toggleFavorite(it) },
-                    onFixTags = { viewModel.startFixTags(it) }
+                    onFixTags = { viewModel.startFixTags(it) },
+                    onEditDetails = { viewModel.editTrack(it) }
                 )
 
                 Tab.PLAYLISTS -> {
@@ -487,6 +573,7 @@ private fun AppScaffold(
                             onAddToQueue = viewModel::addToQueue,
                             onToggleFavorite = { viewModel.toggleFavorite(it) },
                             onFixTags = { viewModel.startFixTags(it) },
+                            onEditDetails = { viewModel.editTrack(it) },
                             onRemoveFromPlaylist = {
                                 viewModel.removeFromPlaylist(open.id, it.id)
                             }
@@ -562,6 +649,76 @@ private fun AppScaffold(
         )
     }
 
+    if (archiveState.running || archiveState.note != null) {
+        AlertDialog(
+            onDismissRequest = { if (!archiveState.running) viewModel.dismissArchive() },
+            title = { Text(if (archiveState.running) "Zipping" else "Zip and ship") },
+            text = {
+                Column {
+                    if (archiveState.running) {
+                        LinearProgressIndicator(
+                            progress = { archiveState.fraction },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            archiveState.current,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1
+                        )
+                    }
+                    archiveState.note?.let {
+                        Text(it, style = MaterialTheme.typography.bodyMedium)
+                    }
+                    // The path is the whole point, so it is spelled out rather
+                    // than left for the user to hunt for.
+                    archiveState.file?.let { file ->
+                        Spacer(Modifier.height(10.dp))
+                        Text("Saved to", style = MaterialTheme.typography.labelMedium)
+                        Text(
+                            file.parent ?: file.absolutePath,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(file.name, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                val file = archiveState.file
+                if (archiveState.running) {
+                    TextButton(onClick = { viewModel.cancelArchive() }) { Text("Stop") }
+                } else if (file != null) {
+                    TextButton(onClick = {
+                        val uri = runCatching {
+                            androidx.core.content.FileProvider.getUriForFile(
+                                context, context.packageName + ".shared", file
+                            )
+                        }.getOrNull()
+                        if (uri == null) {
+                            Toast.makeText(context, "Couldn't share that file.", Toast.LENGTH_SHORT)
+                                .show()
+                        } else {
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = "application/zip"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                putExtra(Intent.EXTRA_SUBJECT, file.name)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(Intent.createChooser(send, "Send archive"))
+                        }
+                    }) { Text("Ship it") }
+                } else {
+                    TextButton(onClick = { viewModel.dismissArchive() }) { Text("Close") }
+                }
+            },
+            dismissButton = if (archiveState.running) null else {
+                { TextButton(onClick = { viewModel.dismissArchive() }) { Text("Close") } }
+            }
+        )
+    }
+
     addingToPlaylist?.let { track ->
         AddToPlaylistDialog(
             playlists = playlists,
@@ -571,6 +728,26 @@ private fun AppScaffold(
                 addingToPlaylist = null
             },
             onCreate = { name -> viewModel.createPlaylist(name, listOf(track.id)) }
+        )
+    }
+
+    // The same dialog for a whole selection. Kept separate from the
+    // single-track case rather than made nullable-plural, because the two
+    // clear different state on the way out.
+    if (selectionForPlaylist.isNotEmpty()) {
+        val chosen = selectionForPlaylist
+        AddToPlaylistDialog(
+            playlists = playlists,
+            onDismiss = { selectionForPlaylist = emptyList() },
+            onPick = { playlistId ->
+                viewModel.addSelectedToPlaylist(playlistId, chosen)
+                selectionForPlaylist = emptyList()
+            },
+            onCreate = { name ->
+                viewModel.createPlaylist(name, chosen.map { it.id })
+                viewModel.clearSelection()
+                selectionForPlaylist = emptyList()
+            }
         )
     }
 
@@ -588,7 +765,7 @@ private fun AppScaffold(
             modifier = Modifier.fillMaxSize()
         ) {
             Box(Modifier.fillMaxSize()) {
-                if (starry) Starfield(starColor = MaterialTheme.colorScheme.primary)
+                if (starry) ScreenBackdrop()
                 Box(Modifier.windowInsetsPadding(WindowInsets.systemBars)) {
             DownloadScreen(
                 state = dlState,
@@ -617,7 +794,7 @@ private fun AppScaffold(
             modifier = Modifier.fillMaxSize()
         ) {
             Box(Modifier.fillMaxSize()) {
-                if (starry) Starfield(starColor = MaterialTheme.colorScheme.primary)
+                if (starry) ScreenBackdrop()
                 Box(Modifier.windowInsetsPadding(WindowInsets.systemBars)) {
                     when (settingsRoute) {
                         SettingsRoute.APPEARANCE -> AppearanceScreen(
@@ -626,7 +803,12 @@ private fun AppScaffold(
                             onPalette = themeSettings::setPalette,
                             onMode = themeSettings::setMode,
                             onDynamic = themeSettings::setDynamicColor,
-                            onStars = themeSettings::setStars
+                            onStars = themeSettings::setStars,
+                            onWallpaper = themeSettings::setWallpaper,
+                            onClearWallpaper = themeSettings::clearWallpaper,
+                            onWallpaperDim = themeSettings::setWallpaperDim,
+                            onLyricsActive = themeSettings::setLyricsActive,
+                            onLyricsInactive = themeSettings::setLyricsInactive
                         )
 
                         SettingsRoute.SOUND -> SoundScreen(
@@ -654,6 +836,7 @@ private fun AppScaffold(
             onCovers = { redo -> showTools = false; viewModel.updateAllCovers(redo) },
             onIdentify = { redo -> showTools = false; viewModel.identifyAll(redo) },
             onLyrics = { redo -> showTools = false; viewModel.fetchAllLyrics(redo) },
+            onZip = { showTools = false; viewModel.zipLibrary() },
             onDuplicates = {
                 showTools = false
                 showDuplicates = true
@@ -679,6 +862,16 @@ private fun AppScaffold(
         BulkImportDialog(progress = progress, onCancel = { viewModel.cancelBulkImport() })
     }
 
+    editTarget?.let { track ->
+        EditTrackDialog(
+            track = track,
+            onSave = { title, artist, album, year ->
+                viewModel.saveTrackDetails(track, title, artist, album, year)
+            },
+            onDismiss = { viewModel.dismissEdit() }
+        )
+    }
+
     tagTarget?.let { track ->
         FixTagsDialog(
             track = track,
@@ -690,7 +883,7 @@ private fun AppScaffold(
     }
 
     AnimatedVisibility(visible = showSplash, exit = fadeOut()) {
-        SplashScreen(showStars = starry)
+        SplashScreen(showStars = LocalStarsVisible.current)
     }
 
     BackHandler(enabled = showDownload) { showDownload = false }

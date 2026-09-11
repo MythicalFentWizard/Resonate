@@ -13,6 +13,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import kotlin.math.PI
 import kotlin.math.sin
@@ -88,10 +89,20 @@ fun Starfield(
             if (star.radius > 1.4f) {
                 // A soft halo makes the brighter stars feel like light rather
                 // than a flat dot.
+                val centre = Offset(star.x * w, y * h)
+                val halo = radius * 3.6f
                 drawCircle(
-                    color = starColor.copy(alpha = alpha * 0.16f),
-                    radius = radius * 3.2f,
-                    center = Offset(star.x * w, y * h)
+                    brush = Brush.radialGradient(
+                        listOf(
+                            starColor.copy(alpha = alpha * 0.24f),
+                            starColor.copy(alpha = alpha * 0.07f),
+                            Color.Transparent
+                        ),
+                        centre,
+                        halo
+                    ),
+                    radius = halo,
+                    center = centre
                 )
             }
             drawCircle(

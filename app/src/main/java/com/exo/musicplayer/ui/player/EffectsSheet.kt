@@ -58,6 +58,8 @@ fun EffectsSheet(
     mirrorOutputs: Boolean,
     onPickOutput: (String) -> Unit,
     onMirrorOutputs: (Boolean) -> Unit,
+    /** Drives the "live"/"idle" note on the meter. */
+    playing: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -66,6 +68,11 @@ fun EffectsSheet(
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp)
     ) {
+        // Above the controls, as on the Windows build: the effects are the
+        // reason to look at the meter, so it belongs where the effects are and
+        // it only runs while this sheet is open.
+        SpectrumMeter(playing = playing, modifier = Modifier.padding(bottom = 16.dp))
+
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
                 Icons.Default.GraphicEq,
@@ -159,6 +166,15 @@ fun EffectsSheet(
             }
         }
 
+        Spacer(Modifier.height(6.dp))
+        Text(
+            // Says what the selected preset actually does. "Nightcore" and
+            // "Deep" are not self-explanatory, and the chips have no room to be.
+            text = FxPreset.entries.firstOrNull { matches(state, it) }?.note ?: "Custom",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
         Spacer(Modifier.height(20.dp))
         PitchMeter(semitones = state.pitchSemitones)
         Slider(
@@ -169,6 +185,7 @@ fun EffectsSheet(
             steps = 95,
             modifier = Modifier.fillMaxWidth()
         )
+        TickRow(listOf("-12", "-6", "0", "+6", "+12"))
         LabelRow("Pitch", state.pitchLabel)
 
         Spacer(Modifier.height(18.dp))
@@ -342,4 +359,25 @@ private fun matches(state: AudioFxState, preset: FxPreset): Boolean {
         kotlin.math.abs(state.pitchSemitones - p.pitchSemitones) < 0.05f &&
         state.reverbEnabled == p.reverbEnabled &&
         (!p.reverbEnabled || state.reverbRoom == p.reverbRoom)
+}
+
+/**
+ * Scale markings under a slider.
+ *
+ * A slider with no scale only tells you where the handle is, not what that
+ * means, which matters most for pitch — where the useful information is how far
+ * from centre you are.
+ */
+@Composable
+private fun TickRow(labels: List<String>) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
+        labels.forEachIndexed { index, label ->
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (index != labels.lastIndex) Spacer(Modifier.weight(1f))
+        }
+    }
 }

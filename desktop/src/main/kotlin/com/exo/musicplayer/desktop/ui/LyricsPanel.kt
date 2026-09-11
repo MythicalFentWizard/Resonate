@@ -103,21 +103,24 @@ fun LyricsPanel(controller: DesktopController, track: DesktopTrack?, positionMs:
 
         Spacer(Modifier.height(12.dp))
 
+        // Read once each: these are state, and a second read of the same one
+        // can come back null between a fetch finishing and this being drawn.
+        val synced = controller.lyricsSynced
+        val plain = controller.lyricsPlain
         when {
             editing -> LyricsEditor(
-                initial = controller.lyricsSynced ?: controller.lyricsPlain.orEmpty(),
+                initial = synced ?: plain.orEmpty(),
                 onSave = { text ->
                     controller.saveManualLyrics(track, text)
                     editing = false
                 }
             )
 
-            controller.lyricsSynced != null ->
-                SyncedLyrics(controller.lyricsSynced!!, positionMs)
+            synced != null -> SyncedLyrics(synced, positionMs)
 
-            controller.lyricsPlain != null ->
+            plain != null ->
                 Text(
-                    controller.lyricsPlain!!,
+                    plain,
                     style = MaterialTheme.typography.bodyMedium,
                     color = Palette.TextDim,
                     lineHeight = MaterialTheme.typography.bodyMedium.fontSize * 1.6,
@@ -162,7 +165,11 @@ private fun SyncedLyrics(lrc: String, positionMs: Long) {
                 line.text.ifBlank { "·" },
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
-                color = if (isActive) Palette.Accent else Palette.TextDim.copy(alpha = alpha),
+                color = if (isActive) {
+                    Palette.LyricsActive
+                } else {
+                    Palette.LyricsInactive.copy(alpha = Palette.LyricsInactive.alpha * alpha)
+                },
                 modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp)
             )
         }

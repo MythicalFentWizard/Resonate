@@ -135,9 +135,11 @@ object AudioSampler {
             val decoded = pcm.copyOf(written)
             val resampled = Dsp.resample(decoded, sampleRate, ShazamSignature.SAMPLE_RATE)
 
-            // The reference pads short input rather than fingerprinting a stub.
+            // The reference pads short input rather than fingerprinting a stub,
+            // and copyOf does both halves of that: it truncates a long window and
+            // zero-pads a short one.
             val target = seconds * ShazamSignature.SAMPLE_RATE
-            if (resampled.size >= target) resampled.copyOf(target) else resampled.copyOf(target)
+            resampled.copyOf(target)
         } catch (t: Throwable) {
             Log.w(TAG, "Sampling failed for $uri", t)
             null

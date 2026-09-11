@@ -16,6 +16,7 @@ import java.net.URL
 enum class SortMode(val label: String) {
     TITLE("Title"),
     ARTIST("Artist"),
+    ALBUM("Album"),
     RECENTLY_ADDED("Recently added"),
     DURATION("Longest first"),
     MOST_PLAYED("Most played")
@@ -31,6 +32,7 @@ class LibraryRepository(context: Context) {
     fun observeTracks(sort: SortMode): Flow<List<Track>> = when (sort) {
         SortMode.TITLE -> trackDao.observeByTitle()
         SortMode.ARTIST -> trackDao.observeByArtist()
+        SortMode.ALBUM -> trackDao.observeByAlbum()
         SortMode.RECENTLY_ADDED -> trackDao.observeByRecentlyAdded()
         SortMode.DURATION -> trackDao.observeByDuration()
         SortMode.MOST_PLAYED -> trackDao.observeByPlayCount()
@@ -81,6 +83,33 @@ class LibraryRepository(context: Context) {
             album = match.album ?: track.album,
             year = match.releaseYear ?: track.year,
             artPath = artPath
+        )
+        trackDao.update(updated)
+        updated
+    }
+
+    /**
+     * Writes hand-edited details onto a track.
+     *
+     * Blank artist, album and year are stored as null rather than skipped:
+     * clearing a wrong value has to be possible, which is the whole reason
+     * manual editing exists alongside automatic identification. The title
+     * falls back to the file name, because a row with no title cannot be shown.
+     */
+    suspend fun saveDetails(
+        track: Track,
+        title: String,
+        artist: String,
+        album: String,
+        year: Int?
+    ): Track = withContext(Dispatchers.IO) {
+        val updated = track.copy(
+            title = title.trim().ifBlank {
+                File(track.filePath).nameWithoutExtension.ifBlank { track.title }
+            },
+            artist = artist.trim().takeIf { it.isNotEmpty() },
+            album = album.trim().takeIf { it.isNotEmpty() },
+            year = year
         )
         trackDao.update(updated)
         updated

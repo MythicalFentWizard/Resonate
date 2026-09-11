@@ -25,15 +25,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import com.exo.musicplayer.desktop.data.DesktopController
 import com.exo.musicplayer.desktop.ui.DesktopApp
+import com.exo.musicplayer.desktop.ui.LyricsWindow
 import com.exo.musicplayer.desktop.ui.Palette
 import com.exo.musicplayer.desktop.ui.ResonateDesktopTheme
+import com.exo.musicplayer.desktop.ui.ScaledToWindow
 import kotlinx.coroutines.delay
+import java.awt.Dimension
 import java.io.File
 import javax.swing.JFileChooser
 import javax.swing.UIManager
@@ -50,21 +58,60 @@ fun main() = application {
     // The folder picker is Swing; matching the OS look keeps it from standing out.
     runCatching { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()) }
 
+    // Held here rather than inside AppHost so the controller outlives
+    // recomposition and the window's key handler can reach it.
+    val scope = rememberCoroutineScope()
+    val controller = remember { DesktopController(scope) }
+
     Window(
         onCloseRequest = ::exitApplication,
         title = "Resonate",
-        state = rememberWindowState(width = 1280.dp, height = 820.dp)
+        state = rememberWindowState(width = 1280.dp, height = 820.dp),
+        // Window level, not view level: Ctrl+A has to work whether or not the
+        // track table happens to hold focus, and a text field that owns the
+        // keystroke still gets first refusal because it is a preview handler
+        // only for keys we claim.
+        onPreviewKeyEvent = { event ->
+            when {
+                event.type == KeyEventType.KeyDown &&
+                    event.isCtrlPressed && event.key == Key.A -> {
+                    controller.selectAll(controller.visibleTracks)
+                    true
+                }
+                event.type == KeyEventType.KeyDown && event.key == Key.Escape &&
+                    controller.hasSelection -> {
+                    controller.clearSelection()
+                    true
+                }
+                else -> false
+            }
+        }
     ) {
+        // The smallest window the scaled layout still fits in.
+        LaunchedEffect(Unit) { window.minimumSize = Dimension(760, 500) }
         ResonateDesktopTheme {
-            AppHost()
+            ScaledToWindow(designWidth = 1180.dp, designHeight = 640.dp) {
+                AppHost(controller)
+            }
+        }
+    }
+
+    if (controller.lyricsDetached) {
+        Window(
+            onCloseRequest = { controller.lyricsDetached = false },
+            title = "Lyrics · Resonate",
+            state = rememberWindowState(width = 460.dp, height = 700.dp)
+        ) {
+            LaunchedEffect(Unit) { window.minimumSize = Dimension(300, 360) }
+            ResonateDesktopTheme {
+                ScaledToWindow(designWidth = 420.dp, designHeight = 560.dp) { LyricsWindow(controller) }
+            }
         }
     }
 }
 
 @Composable
-private fun AppHost() {
-    val scope = rememberCoroutineScope()
-    val controller = remember { DesktopController(scope) }
+private fun AppHost(controller: DesktopController) {
     val status by controller.engine.status.collectAsState()
 
     // Shown once per launch, not on every navigation — a splash that reappears

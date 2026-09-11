@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoFixHigh
+import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.automirrored.filled.Article
 import androidx.compose.material.icons.filled.Image
@@ -45,6 +46,7 @@ fun LibraryToolsDialog(
     onIdentify: (Boolean) -> Unit,
     onLyrics: (Boolean) -> Unit,
     onDuplicates: () -> Unit,
+    onZip: () -> Unit,
     onDismiss: () -> Unit
 ) {
     var redo by remember { mutableStateOf(false) }
@@ -108,6 +110,19 @@ fun LibraryToolsDialog(
                     redo = redo,
                     note = "Different copies of the same song. Review before removing.",
                     onClick = onDuplicates
+                )
+                // Not gated on a pending count like the others: archiving is
+                // something you do to the whole library, not to whatever part
+                // of it has not been processed yet.
+                ToolRow(
+                    icon = Icons.Default.Archive,
+                    title = "Zip and ship",
+                    pending = counts.total,
+                    total = counts.total,
+                    redo = redo,
+                    note = "Bundles every track into one .zip and tells you where it " +
+                        "saved it, ready to send on.",
+                    onClick = onZip
                 )
                 ToolRow(
                     icon = Icons.AutoMirrored.Filled.Article,

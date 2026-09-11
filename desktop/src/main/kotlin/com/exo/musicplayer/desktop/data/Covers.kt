@@ -1,5 +1,8 @@
 package com.exo.musicplayer.desktop.data
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
 import com.exo.musicplayer.desktop.library.DesktopTrack
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +33,13 @@ object Covers {
 
     /** Paths already checked and found to have no art, so they aren't re-read. */
     private val misses = Thumbnails.BoundedKeySet()
+
+    /**
+     * Goes up whenever a cover is fetched, so covers already on screen swap in
+     * while a bulk run is still going rather than only after they scroll away.
+     */
+    var revision by mutableStateOf(0)
+        private set
 
     private val sidecarNames = listOf(
         "cover.jpg", "cover.png", "folder.jpg", "folder.png",
@@ -71,7 +81,7 @@ object Covers {
         url: String,
         embedInFile: Boolean
     ): Boolean = withContext(Dispatchers.IO) {
-        val bytes = download(url) ?: return@withContext false
+        val bytes = download(url)?.let(Thumbnails::squared) ?: return@withContext false
         // Decoded once to prove it is a real image, and that same result is
         // what goes in the cache rather than decoding a second time.
         val bitmap = Thumbnails.decodeScaled(bytes) ?: return@withContext false
@@ -82,6 +92,7 @@ object Covers {
         val key = track.file.absolutePath
         misses -= key
         memory[key] = bitmap
+        revision++
         true
     }
 
@@ -147,7 +158,15 @@ object Covers {
             .joinToString("") { "%02x".format(it) }
 }
 
-/** Writes identified metadata back into the file's tags. */
+/**
+ * Writes metadata back into a file's tags.
+ *
+ * Two callers with opposite needs, hence [clearBlanks]. Automatic
+ * identification must never wipe a field it has no opinion about, so a null or
+ * blank value there means "leave it alone". Hand editing must be able to empty
+ * a field, because correcting a wrong album name to nothing is a legitimate
+ * edit and a writer that silently ignored it would look broken.
+ */
 object TagWriter {
 
     fun write(
@@ -155,14 +174,34 @@ object TagWriter {
         title: String?,
         artist: String?,
         album: String?,
-        year: Int?
+        year: Int?,
+        clearBlanks: Boolean = false
     ): Result<Unit> = runCatching {
         val audio = AudioFileIO.read(file)
         val tag = audio.tagOrCreateAndSetDefault
-        title?.takeIf { it.isNotBlank() }?.let { tag.setField(FieldKey.TITLE, it) }
-        artist?.takeIf { it.isNotBlank() }?.let { tag.setField(FieldKey.ARTIST, it) }
-        album?.takeIf { it.isNotBlank() }?.let { tag.setField(FieldKey.ALBUM, it) }
-        year?.let { tag.setField(FieldKey.YEAR, it.toString()) }
+
+        fun apply(key: FieldKey, value: String?) {
+            val text = value?.trim()
+            when {
+                !text.isNullOrEmpty() -> tag.setField(key, text)
+                clearBlanks -> runCatching { tag.deleteField(key) }
+            }
+        }
+
+        apply(FieldKey.TITLE, title)
+        apply(FieldKey.ARTIST, artist)
+        apply(FieldKey.ALBUM, album)
+        apply(FieldKey.YEAR, year?.toString())
+        audio.commit()
+    }
+
+    /** Writes only the fields [change] names, leaving the rest of the tag alone. */
+    fun change(change: TagChange): Result<Unit> = runCatching {
+        val audio = AudioFileIO.read(change.file)
+        val tag = audio.tagOrCreateAndSetDefault
+        change.artist?.let { tag.setField(FieldKey.ARTIST, it) }
+        change.album?.let { tag.setField(FieldKey.ALBUM, it) }
+        change.albumArtist?.let { tag.setField(FieldKey.ALBUM_ARTIST, it) }
         audio.commit()
     }
 }

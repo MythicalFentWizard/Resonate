@@ -20,10 +20,49 @@ interface LyricsProvider {
  * coverage. A provider erroring out is treated the same as finding nothing, so
  * one service being down never blocks the rest.
  */
+private val LYRIC_BRACKETS = Regex("""\(.*?\)|\[.*?]|【.*?】""")
+private val LYRIC_SPACES = Regex("""\s+""")
+private val LYRIC_ARTIST_SPLIT = Regex("""\s*(,|&|\bx\b|\bfeat\.?|\bft\.?)\s*""", RegexOption.IGNORE_CASE)
+
 class LyricsProviderChain(
     private val providers: List<LyricsProvider>
 ) {
+    /**
+     * Looks the song up as named, then by pieces of its name when that finds
+     * nothing: downloaded files are often called "Artist - Song (Official
+     * Video) [Channel]" or credit "A, B x C", which no lyrics service knows.
+     */
     suspend fun fetch(
+        title: String,
+        artist: String?,
+        album: String?,
+        durationMs: Long
+    ): Pair<LyricsFetch, String?> {
+        var first: Pair<LyricsFetch, String?>? = null
+        for ((pieceTitle, pieceArtist) in segments(title, artist)) {
+            val result = fetchOnce(pieceTitle, pieceArtist, album, durationMs)
+            if (result.first is LyricsFetch.Found || result.first is LyricsFetch.Instrumental) return result
+            if (first == null) first = result
+        }
+        return first ?: (LyricsFetch.NotFound to null)
+    }
+
+    /** The name as given, then without brackets, split at " - ", and by the first artist alone. */
+    private fun segments(title: String, artist: String?): List<Pair<String, String?>> {
+        fun clean(text: String) = text.replace(LYRIC_BRACKETS, " ").replace(LYRIC_SPACES, " ").trim()
+        fun lead(text: String?) =
+            text?.split(LYRIC_ARTIST_SPLIT)?.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() }
+        val cleanTitle = clean(title)
+        val dash = cleanTitle.split(" - ", limit = 2).takeIf { it.size == 2 }
+        return listOfNotNull(
+            title to artist,
+            cleanTitle to lead(artist),
+            dash?.let { clean(it[1]) to lead(it[0]) },
+            cleanTitle to null
+        ).filter { it.first.isNotBlank() }.distinct()
+    }
+
+    private suspend fun fetchOnce(
         title: String,
         artist: String?,
         album: String?,

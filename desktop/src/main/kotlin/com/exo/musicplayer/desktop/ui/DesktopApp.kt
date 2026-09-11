@@ -1,10 +1,21 @@
 package com.exo.musicplayer.desktop.ui
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ContextMenuArea
 import androidx.compose.foundation.ContextMenuItem
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.draganddrop.dragAndDropTarget
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.onClick
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
@@ -29,9 +40,21 @@ import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.automirrored.filled.VolumeDown
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Album
+import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CreateNewFolder
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
@@ -67,15 +90,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.isCtrlPressed
+import androidx.compose.ui.input.pointer.isShiftPressed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.exo.musicplayer.desktop.data.CollectionKind
 import com.exo.musicplayer.desktop.data.DesktopController
+import com.exo.musicplayer.desktop.data.DownloadEntry
 import com.exo.musicplayer.desktop.data.SortMode
 import com.exo.musicplayer.desktop.library.DesktopTrack
+import com.exo.musicplayer.desktop.system.Explorer
 import com.exo.musicplayer.util.asDuration
+import kotlinx.coroutines.delay
 import java.awt.Desktop
 import java.io.File
 import java.util.Locale
@@ -83,6 +112,7 @@ import java.util.Locale
 enum class Destination(val label: String, val icon: ImageVector) {
     LIBRARY("Library", Icons.Default.LibraryMusic),
     ALBUMS("Albums", Icons.Default.Album),
+    ARTISTS("Artists", Icons.Default.Person),
     PLAYLISTS("Playlists", Icons.AutoMirrored.Filled.QueueMusic),
     IDENTIFY("Identify", Icons.Default.Fingerprint),
     MOODS("Moods", Icons.Default.Cloud),
@@ -100,6 +130,7 @@ enum class Destination(val label: String, val icon: ImageVector) {
  * arrangement every desktop music player has converged on, because it survives a
  * 1400px-wide window where a phone layout does not.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun DesktopApp(
     controller: DesktopController,
@@ -115,72 +146,124 @@ fun DesktopApp(
     val status by controller.engine.status.collectAsState()
     val visible = controller.visibleTracks
 
-    Box(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize().background(Palette.Base)) {
+    // Being on the Download page counts as having seen what finished, so the
+    // Download item stops shining once you have been there.
+    val onDownloadPage = !showSettings && destination == Destination.DOWNLOAD
+    LaunchedEffect(onDownloadPage, controller.downloads) {
+        if (onDownloadPage) controller.acknowledgeDownloads()
+    }
+
+    // Songs, folders and links dropped anywhere on the window.
+    val dropTarget = remember(controller) {
+        fileDropTarget(
+            onHover = { controller.dropHover = it },
+            onFiles = controller::importDropped,
+            onText = controller::importDroppedText
+        )
+    }
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .dragAndDropTarget(shouldStartDragAndDrop = { true }, target = dropTarget)
+    ) {
+        Wallpaper(controller.wallpaper, controller.wallpaperDim, Modifier.matchParentSize())
+        Column(
+            Modifier
+                .fillMaxSize()
+                .background(if (controller.wallpaper != null) Color.Transparent else Palette.Base)
+        ) {
             Row(Modifier.weight(1f).fillMaxWidth()) {
                 NavigationRail(
+                    controller = controller,
                     current = if (showSettings) null else destination,
                     settingsOpen = showSettings,
                     onSelect = { destination = it; showSettings = false },
                     onSettings = { showSettings = !showSettings }
                 )
 
-                Column(
+                Box(
                     Modifier
                         .weight(1f)
                         .fillMaxHeight()
-                        .background(Palette.Content)
+                        .background(Palette.Content.copy(alpha = if (controller.wallpaper != null) 0.3f else 1f))
                 ) {
-                    ContentHeader(
-                        controller = controller,
-                        title = if (showSettings) "Settings" else destination.label,
-                        destination = destination,
-                        showSettings = showSettings,
-                        shownCount = visible.size,
-                        onAddFolder = { onChooseFolder()?.let(controller::addFolder) },
-                        onBulk = { dialog = DialogKind.BULK },
-                        onDuplicates = {
-                            controller.findDuplicates()
-                            dialog = DialogKind.DUPLICATES
-                        }
+                    Backdrop(
+                        style = controller.backdrop,
+                        color = Palette.Stars,
+                        spectrum = controller.engine.spectrum,
+                        graph = controller.songGraph,
+                        beat = controller.engine.beat,
+                        reactiveMode = controller.reactiveMode,
+                        modifier = Modifier.matchParentSize()
                     )
-
-                    if (controller.scanning) {
-                        LinearProgressIndicator(
-                            Modifier.fillMaxWidth().height(2.dp),
-                            color = Palette.Accent,
-                            trackColor = Palette.Line
+                    Column(Modifier.fillMaxSize()) {
+                        ContentHeader(
+                            controller = controller,
+                            title = if (showSettings) "Settings" else destination.label,
+                            destination = destination,
+                            showSettings = showSettings,
+                            shownCount = visible.size,
+                            onAddFolder = { onChooseFolder()?.let(controller::addFolder) },
+                            onBulk = { dialog = DialogKind.BULK },
+                            onDuplicates = {
+                                controller.findDuplicates()
+                                dialog = DialogKind.DUPLICATES
+                            }
                         )
-                    }
 
-                    when {
-                        showSettings -> SettingsScreen(controller, onChooseFolder)
-                        destination == Destination.LIBRARY ->
-                            LibraryPane(
-                                controller = controller,
-                                tracks = visible,
-                                nowPlaying = status.track,
-                                onAddFolder = { onChooseFolder()?.let(controller::addFolder) },
-                                onAddToPlaylist = { items ->
-                                    playlistTargets = items
-                                    controller.refreshPlaylists()
-                                    dialog = DialogKind.ADD_TO_PLAYLIST
-                                },
-                                onIdentify = { track ->
-                                    controller.identifyTarget = track
-                                    destination = Destination.IDENTIFY
-                                    controller.identifyFile(track)
-                                }
+                        ArchiveStrip(controller)
+
+                        if (controller.scanning) {
+                            LinearProgressIndicator(
+                                Modifier.fillMaxWidth().height(2.dp),
+                                color = Palette.Accent,
+                                trackColor = Palette.Line
                             )
-                        destination == Destination.ALBUMS -> AlbumsScreen(controller)
-                        destination == Destination.PLAYLISTS ->
-                            PlaylistsScreen(controller, onPickPlaylistFile)
-                        destination == Destination.IDENTIFY ->
-                            IdentifyScreen(controller, onChooseMedia)
-                        destination == Destination.MOODS -> MoodsScreen(controller)
-                        destination == Destination.STATS -> StatsScreen(controller)
-                        destination == Destination.DOWNLOAD ->
-                            DownloadScreen(controller, onChooseFolder)
+                        }
+
+                        when {
+                            showSettings -> SettingsScreen(controller, onChooseFolder)
+                            destination == Destination.LIBRARY ->
+                                LibraryPane(
+                                    controller = controller,
+                                    tracks = visible,
+                                    nowPlaying = status.track,
+                                    onAddFolder = { onChooseFolder()?.let(controller::addFolder) },
+                                    onAddToPlaylist = { items ->
+                                        playlistTargets = items
+                                        controller.refreshPlaylists()
+                                        dialog = DialogKind.ADD_TO_PLAYLIST
+                                    },
+                                    onIdentify = { track ->
+                                        controller.identifyTarget = track
+                                        destination = Destination.IDENTIFY
+                                        controller.identifyFile(track)
+                                    }
+                                )
+                            destination == Destination.ALBUMS || destination == Destination.ARTISTS ->
+                                CollectionScreen(
+                                    controller = controller,
+                                    kind = if (destination == Destination.ALBUMS) {
+                                        CollectionKind.ALBUMS
+                                    } else {
+                                        CollectionKind.ARTISTS
+                                    },
+                                    onMerge = { dialog = DialogKind.MERGE },
+                                    onClearDuplicates = { within ->
+                                        controller.findDuplicates(within)
+                                        dialog = DialogKind.DUPLICATES
+                                    }
+                                )
+                            destination == Destination.PLAYLISTS ->
+                                PlaylistsScreen(controller, onPickPlaylistFile)
+                            destination == Destination.IDENTIFY ->
+                                IdentifyScreen(controller, onChooseMedia)
+                            destination == Destination.MOODS -> MoodsScreen(controller)
+                            destination == Destination.STATS -> StatsScreen(controller)
+                            destination == Destination.DOWNLOAD ->
+                                DownloadScreen(controller, onChooseFolder)
+                        }
                     }
                 }
 
@@ -206,52 +289,129 @@ fun DesktopApp(
             )
         }
 
+        // Editing is driven off the controller rather than the local dialog
+        // state, because it is opened from the row context menu and from the
+        // Identify screen, and neither should have to know about the other.
+        controller.editTarget?.let { track ->
+            EditTrackDialog(controller, track) { controller.dismissEdit() }
+        }
+
         when (dialog) {
             DialogKind.BULK -> BulkToolsDialog(controller) { dialog = null }
             DialogKind.DUPLICATES -> DuplicatesDialog(controller) { dialog = null }
+            DialogKind.MERGE -> MergeDialog(controller) { dialog = null }
             DialogKind.ADD_TO_PLAYLIST ->
                 AddToPlaylistDialog(controller, playlistTargets) { dialog = null }
             null -> Unit
+        }
+
+        if (controller.dropHover) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Palette.Base.copy(alpha = 0.82f))
+                    .padding(28.dp)
+                    .border(2.dp, Palette.Accent, RoundedCornerShape(16.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        "Drop to add to your library",
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = Palette.Text
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Songs are copied into your music folder, folders are added where " +
+                            "they are, and links start downloading.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Palette.TextDim
+                    )
+                }
+            }
+        }
+
+        controller.dropNote?.let { note ->
+            LaunchedEffect(note) {
+                delay(5000)
+                controller.dismissDropNote()
+            }
+            Box(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 96.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Palette.Raised)
+                    .border(1.dp, Palette.Line, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
+            ) {
+                Text(note, style = MaterialTheme.typography.bodyMedium, color = Palette.Text)
+            }
         }
     }
 }
 
 @Composable
 private fun NavigationRail(
+    controller: DesktopController,
     current: Destination?,
     settingsOpen: Boolean,
     onSelect: (Destination) -> Unit,
     onSettings: () -> Unit
 ) {
-    Column(
+    Box(
         Modifier
             .width(212.dp)
             .fillMaxHeight()
-            .background(Palette.Sidebar)
-            .padding(vertical = 14.dp)
+            .background(Palette.Sidebar.copy(alpha = if (controller.wallpaper != null) 0.6f else 1f))
     ) {
-        Row(
-            Modifier.padding(horizontal = 18.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(Modifier.size(9.dp).clip(CircleShape).background(Palette.Accent))
-            Spacer(Modifier.width(10.dp))
-            Text("Resonate", style = MaterialTheme.typography.titleLarge, color = Palette.Text)
-        }
-
-        Spacer(Modifier.height(14.dp))
-        Destination.entries.forEach { entry ->
-            RailItem(entry.label, entry.icon, entry == current) { onSelect(entry) }
-        }
-
-        Spacer(Modifier.weight(1f))
-        RailItem("Settings", Icons.Default.Settings, settingsOpen, onSettings)
-        Text(
-            "made by lucent",
-            style = MaterialTheme.typography.labelSmall,
-            color = Palette.TextFaint,
-            modifier = Modifier.padding(start = 20.dp, top = 10.dp)
+        Backdrop(
+            style = controller.backdrop,
+            color = Palette.Stars,
+            spectrum = controller.engine.spectrum,
+            graph = controller.songGraph,
+            beat = controller.engine.beat,
+            reactiveMode = controller.reactiveMode,
+            modifier = Modifier.matchParentSize(),
+            count = 40,
+            centerpiece = false
         )
+        Column(Modifier.fillMaxSize().padding(vertical = 14.dp)) {
+            Row(
+                Modifier.padding(horizontal = 18.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(Modifier.size(9.dp).clip(CircleShape).background(Palette.Accent))
+                Spacer(Modifier.width(10.dp))
+                Text("Resonate", style = MaterialTheme.typography.titleLarge, color = Palette.Text)
+            }
+
+            Spacer(Modifier.height(14.dp))
+            Destination.entries.forEach { entry ->
+                if (entry == Destination.DOWNLOAD) {
+                    val downloads = controller.downloads
+                    RailItem(
+                        label = entry.label,
+                        icon = entry.icon,
+                        selected = entry == current,
+                        badge = downloads.count { !it.done },
+                        shine = controller.unseenFinishedDownloads > 0
+                    ) { onSelect(entry) }
+                    RailDownloads(downloads) { onSelect(Destination.DOWNLOAD) }
+                } else {
+                    RailItem(entry.label, entry.icon, entry == current) { onSelect(entry) }
+                }
+            }
+
+            Spacer(Modifier.weight(1f))
+            RailItem("Settings", Icons.Default.Settings, settingsOpen, onClick = onSettings)
+            Text(
+                "made by lucent",
+                style = MaterialTheme.typography.bodySmall,
+                color = Palette.TextDim,
+                modifier = Modifier.padding(start = 20.dp, top = 10.dp)
+            )
+        }
     }
 }
 
@@ -260,6 +420,10 @@ private fun RailItem(
     label: String,
     icon: ImageVector,
     selected: Boolean,
+    /** A count at the top right; for the Download item, how many are running. */
+    badge: Int = 0,
+    /** A band of light sweeping across, while there is something new to look at. */
+    shine: Boolean = false,
     onClick: () -> Unit
 ) {
     val interaction = remember { MutableInteractionSource() }
@@ -269,31 +433,163 @@ private fun RailItem(
         hovered -> Palette.Hover
         else -> Color.Transparent
     }
+    // Only animated while shining, so an idle rail costs no frames. The sweep is
+    // read inside the draw call, which repaints the item without recomposing it.
+    val sweep = if (shine) {
+        rememberInfiniteTransition(label = "rail-shine").animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(1800, easing = LinearEasing)),
+            label = "sweep"
+        )
+    } else {
+        null
+    }
+    val shape = RoundedCornerShape(7.dp)
 
-    Row(
+    Box(
         Modifier
             .padding(horizontal = 10.dp, vertical = 1.dp)
             .fillMaxWidth()
-            .clip(RoundedCornerShape(7.dp))
-            .background(background)
-            .hoverable(interaction)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 9.dp),
-        verticalAlignment = Alignment.CenterVertically
     ) {
-        Icon(
-            icon,
-            contentDescription = null,
-            tint = if (selected) Palette.Accent else Palette.TextDim,
-            modifier = Modifier.size(17.dp)
-        )
-        Spacer(Modifier.width(11.dp))
-        Text(
-            label,
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-            color = if (selected) Palette.Text else Palette.TextDim
-        )
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clip(shape)
+                .background(background)
+                .then(
+                    if (shine) Modifier.border(1.dp, Palette.Accent.copy(alpha = 0.55f), shape)
+                    else Modifier
+                )
+                .drawWithContent {
+                    drawContent()
+                    val progress = sweep?.value ?: return@drawWithContent
+                    val band = size.width * 0.45f
+                    val x = -band + (size.width + band) * progress
+                    drawRect(
+                        Brush.horizontalGradient(
+                            listOf(
+                                Color.Transparent,
+                                Palette.Accent.copy(alpha = 0.30f),
+                                Color.Transparent
+                            ),
+                            startX = x,
+                            endX = x + band
+                        )
+                    )
+                }
+                .hoverable(interaction)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 10.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = if (selected || shine) Palette.Accent else Palette.TextDim,
+                modifier = Modifier.size(17.dp)
+            )
+            Spacer(Modifier.width(11.dp))
+            Text(
+                label,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                color = if (selected) Palette.Text else Palette.TextDim
+            )
+        }
+        if (badge > 0) {
+            Box(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 3.dp, end = 6.dp)
+                    .clip(CircleShape)
+                    .background(Palette.Accent)
+                    .padding(horizontal = 6.dp, vertical = 1.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    badge.toString(),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Palette.OnAccent
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The latest few downloads, under the Download item.
+ *
+ * A glance rather than the list: newest first, four at most, each one a click
+ * away from the full Download page.
+ */
+@Composable
+private fun RailDownloads(downloads: List<DownloadEntry>, onOpen: () -> Unit) {
+    if (downloads.isEmpty()) return
+    val recent = downloads.asReversed().take(4)
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(start = 26.dp, end = 12.dp, top = 2.dp, bottom = 6.dp)
+    ) {
+        recent.forEach { entry ->
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(5.dp))
+                    .clickable(onClick = onOpen)
+                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(Modifier.size(12.dp), contentAlignment = Alignment.Center) {
+                    when {
+                        entry.failed -> Icon(
+                            Icons.Default.ErrorOutline, "Failed",
+                            Modifier.size(12.dp), tint = Palette.TextFaint
+                        )
+                        entry.done -> Icon(
+                            Icons.Default.Check, "Done",
+                            Modifier.size(12.dp), tint = Palette.Accent
+                        )
+                        else -> CircularProgressIndicator(
+                            Modifier.size(10.dp),
+                            color = Palette.Accent,
+                            strokeWidth = 1.5.dp,
+                            trackColor = Palette.Line
+                        )
+                    }
+                }
+                Spacer(Modifier.width(7.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        entry.display,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (entry.done) Palette.TextFaint else Palette.TextDim,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (!entry.done) {
+                        Spacer(Modifier.height(3.dp))
+                        LinearProgressIndicator(
+                            progress = { entry.percent.coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth().height(2.dp),
+                            color = Palette.Accent,
+                            trackColor = Palette.Line
+                        )
+                    }
+                }
+            }
+        }
+        if (downloads.size > recent.size) {
+            Text(
+                "+${downloads.size - recent.size} more",
+                style = MaterialTheme.typography.labelSmall,
+                color = Palette.TextFaint,
+                modifier = Modifier.padding(start = 25.dp, top = 2.dp)
+            )
+        }
     }
 }
 
@@ -320,6 +616,13 @@ private fun ContentHeader(
         destination == Destination.IDENTIFY -> "Seven catalogues, plus fingerprinting"
         destination == Destination.DOWNLOAD -> "YouTube, SoundCloud, Bandcamp, Spotify"
         destination == Destination.MOODS -> "Songs that match the weather"
+        destination == Destination.ALBUMS || destination == Destination.ARTISTS ->
+            controller.mergeNote
+                ?: if (controller.merging) {
+                    "Merging…"
+                } else {
+                    "Ctrl+click to pick several, then merge them"
+                }
         else -> "${controller.tracks.size} tracks"
     }
 
@@ -327,13 +630,18 @@ private fun ContentHeader(
         Row(
             Modifier
                 .fillMaxWidth()
-                .background(Palette.Content)
                 .padding(start = 24.dp, end = 24.dp, top = 18.dp, bottom = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(Modifier.weight(1f)) {
                 Text(title, style = MaterialTheme.typography.headlineMedium, color = Palette.Text)
-                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = Palette.TextDim)
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Palette.TextDim,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
 
             if (destination == Destination.LIBRARY && !showSettings) {
@@ -353,9 +661,13 @@ private fun ContentHeader(
                 }
                 IconButton(onClick = onAddFolder) {
                     Icon(
-                        Icons.Default.FolderOpen, "Add folder",
+                        Icons.Default.CreateNewFolder, "Add folder",
                         tint = Palette.TextDim, modifier = Modifier.size(18.dp)
                     )
+                }
+                Spacer(Modifier.width(6.dp))
+                GhostButton("Music folder", icon = Icons.Default.FolderOpen) {
+                    controller.openMusicFolder()
                 }
             }
         }
@@ -367,19 +679,30 @@ private fun ContentHeader(
                     .padding(start = 24.dp, end = 24.dp, bottom = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                SegmentedRow(
-                    options = SortMode.entries,
-                    selected = controller.sort,
-                    label = { it.label },
-                    onSelect = { controller.sort = it }
-                )
-                Spacer(Modifier.width(10.dp))
-                FilterToggle(
-                    label = "Favourites",
-                    active = controller.favouritesOnly
-                ) { controller.favouritesOnly = !controller.favouritesOnly }
+                // Seven sort options, a filter and two buttons do not fit
+                // across the content pane once a side panel is open, and a Row
+                // resolves that by crushing its children - which turned "Bulk
+                // tools" into one letter per line. The sort chips scroll
+                // instead, and the buttons sit outside the weighted region so
+                // they keep their intrinsic width whatever else happens.
+                Row(
+                    Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    SegmentedRow(
+                        options = SortMode.entries,
+                        selected = controller.sort,
+                        label = { it.label },
+                        onSelect = { controller.sort = it }
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    FilterToggle(
+                        label = "Favourites",
+                        active = controller.favouritesOnly
+                    ) { controller.favouritesOnly = !controller.favouritesOnly }
+                    Spacer(Modifier.width(10.dp))
+                }
 
-                Spacer(Modifier.weight(1f))
                 GhostButton("Bulk tools", icon = Icons.Default.Tune, onClick = onBulk)
                 Spacer(Modifier.width(8.dp))
                 GhostButton(
@@ -387,6 +710,12 @@ private fun ContentHeader(
                     icon = Icons.Default.ContentCopy,
                     onClick = onDuplicates
                 )
+                Spacer(Modifier.width(8.dp))
+                GhostButton(
+                    "Zip and ship",
+                    enabled = !controller.archiveRunning,
+                    icon = Icons.Default.Archive
+                ) { controller.zipLibrary() }
             }
         }
     }
@@ -448,11 +777,31 @@ private fun LibraryPane(
         return
     }
 
+    // Ctrl and Shift are read at click time rather than tracked, because a
+    // modifier held down between compositions is not an event.
+    val windowInfo = LocalWindowInfo.current
+
     Column(Modifier.fillMaxSize()) {
+        if (controller.hasSelection) {
+            SelectionBar(controller, tracks)
+        }
+        controller.selectionNote?.let { note ->
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    note,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Palette.Accent,
+                    modifier = Modifier.weight(1f)
+                )
+                GhostButton("Dismiss") { controller.dismissSelectionNote() }
+            }
+        }
         Row(
             Modifier
                 .fillMaxWidth()
-                .background(Palette.Content)
                 .padding(start = 24.dp, end = 32.dp, bottom = 8.dp)
         ) {
             HeaderCell("#", Modifier.width(40.dp))
@@ -460,7 +809,7 @@ private fun LibraryPane(
             HeaderCell("Title", Modifier.weight(2.2f))
             HeaderCell("Artist", Modifier.weight(1.4f))
             HeaderCell("Album", Modifier.weight(1.4f))
-            HeaderCell(controller.sort.trailingColumn, Modifier.width(76.dp))
+            HeaderCell(controller.sort.trailingColumn, Modifier.width(100.dp))
         }
         Box(Modifier.fillMaxWidth().height(1.dp).background(Palette.Line))
 
@@ -473,9 +822,17 @@ private fun LibraryPane(
                     controller = controller,
                     isCurrent = track.file == nowPlaying?.file,
                     isFavourite = track.file.absolutePath in controller.favourites,
-                    onPlay = { controller.play(track, tracks) },
+                    isSelected = track.file.absolutePath in controller.selectedPaths,
+                    onPlay = {
+                        // A plain click plays, and drops any selection - leaving
+                        // one active behind the thing you just started would be a trap.
+                        controller.clearSelection()
+                        controller.play(track, tracks)
+                    },
                     onAddToPlaylist = { onAddToPlaylist(listOf(track)) },
-                    onIdentify = { onIdentify(track) }
+                    onIdentify = { onIdentify(track) },
+                    onToggleSelect = { controller.toggleSelection(track) },
+                    onExtendSelect = { controller.extendSelection(track, tracks) }
                 )
             }
         }
@@ -501,6 +858,7 @@ private fun HeaderCell(text: String, modifier: Modifier = Modifier) {
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TrackRow(
     index: Int,
@@ -508,9 +866,12 @@ private fun TrackRow(
     controller: DesktopController,
     isCurrent: Boolean,
     isFavourite: Boolean,
+    isSelected: Boolean,
     onPlay: () -> Unit,
     onAddToPlaylist: () -> Unit,
-    onIdentify: () -> Unit
+    onIdentify: () -> Unit,
+    onToggleSelect: () -> Unit = {},
+    onExtendSelect: () -> Unit = {}
 ) {
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
@@ -526,7 +887,11 @@ private fun TrackRow(
                 ) { controller.toggleFavourite(track) },
                 ContextMenuItem("Add to playlist...") { onAddToPlaylist() },
                 ContextMenuItem("Identify this track") { onIdentify() },
-                ContextMenuItem("Show in Explorer") { revealInExplorer(track.file) }
+                ContextMenuItem("Edit details...") { controller.editTarget = track },
+                ContextMenuItem("Show in Explorer") { revealInExplorer(track.file) },
+                ContextMenuItem("Delete (move to Recycle Bin)") {
+                    controller.deleteTracks(listOf(track))
+                }
             )
         }
     ) {
@@ -535,20 +900,36 @@ private fun TrackRow(
                 .fillMaxWidth()
                 .background(
                     when {
+                        // Selection outranks "now playing" here: while a
+                        // selection exists it is the thing being acted on.
+                        isSelected -> Palette.Accent.copy(alpha = 0.20f)
                         isCurrent -> Palette.Selected
                         hovered -> Palette.Hover
                         else -> Color.Transparent
                     }
                 )
                 .hoverable(interaction)
-                .clickable(onClick = onPlay)
+                // Ctrl and Shift are read from the click itself. They used to come
+                // from the window's keyboard state, which a Ctrl+click did not
+                // reliably reach, so it was taken for a plain click: it played the
+                // track and dropped the selection instead of adding to it.
+                .onClick(keyboardModifiers = { isCtrlPressed }, onClick = onToggleSelect)
+                .onClick(keyboardModifiers = { isShiftPressed && !isCtrlPressed }, onClick = onExtendSelect)
+                .onClick(keyboardModifiers = { !isCtrlPressed && !isShiftPressed }, onClick = onPlay)
                 .padding(start = 24.dp, end = 32.dp, top = 5.dp, bottom = 5.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(Modifier.width(40.dp)) {
                 // The row number gives way to a play affordance on hover, which
                 // is how desktop players signal "click here" without a button.
-                if (hovered) {
+                if (isSelected) {
+                    Icon(
+                        Icons.Default.Check,
+                        null,
+                        Modifier.size(15.dp),
+                        tint = Palette.Accent
+                    )
+                } else if (hovered) {
                     Icon(Icons.Default.PlayArrow, null, Modifier.size(15.dp), tint = Palette.Text)
                 } else {
                     Text(
@@ -569,7 +950,7 @@ private fun TrackRow(
             Cell(track.displayAlbum, Modifier.weight(1.4f), Palette.TextDim)
 
             Row(
-                Modifier.width(76.dp),
+                Modifier.width(100.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (hovered || isFavourite) {
@@ -589,6 +970,25 @@ private fun TrackRow(
                             "Favourite",
                             Modifier.size(13.dp),
                             tint = if (isFavourite) Palette.Accent else Palette.TextFaint
+                        )
+                    }
+                    Spacer(Modifier.width(6.dp))
+                }
+                if (hovered) {
+                    // On hover only: a delete button showing on every row would be
+                    // a hazard in a long list. It goes to the Recycle Bin anyway.
+                    Box(
+                        Modifier
+                            .size(20.dp)
+                            .clip(RoundedCornerShape(5.dp))
+                            .clickable { controller.deleteTracks(listOf(track)) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.DeleteOutline,
+                            "Move to Recycle Bin",
+                            Modifier.size(14.dp),
+                            tint = Palette.TextFaint
                         )
                     }
                     Spacer(Modifier.width(6.dp))
@@ -852,15 +1252,136 @@ private fun BarToggle(
     }
 }
 
-private fun revealInExplorer(file: File) {
-    runCatching {
-        // "/select," highlights the file rather than just opening its folder.
-        ProcessBuilder("explorer.exe", "/select,${file.absolutePath}").start()
-    }.onFailure {
-        runCatching {
-            file.parentFile?.let { parent ->
-                if (Desktop.isDesktopSupported()) Desktop.getDesktop().open(parent)
+private fun revealInExplorer(file: File) = Explorer.reveal(file)
+
+/**
+ * Progress and outcome of a zip, under the toolbar.
+ *
+ * Shown here rather than in a dialog because archiving a large library takes a
+ * while and there is no reason to block the app during it - you can carry on
+ * browsing and come back when the path appears.
+ */
+@Composable
+private fun ArchiveStrip(controller: DesktopController) {
+    val note = controller.archiveNote
+    val file = controller.archiveFile
+    if (!controller.archiveRunning && note == null) return
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 24.dp)
+            .padding(bottom = 10.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(Palette.Raised)
+            .padding(14.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Default.Archive,
+                null,
+                Modifier.size(15.dp),
+                tint = Palette.Accent
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                if (controller.archiveRunning) "Building archive" else "Archive ready",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Palette.Text,
+                modifier = Modifier.weight(1f)
+            )
+            if (controller.archiveRunning) {
+                GhostButton("Stop") { controller.cancelArchive() }
+            } else {
+                if (file != null) {
+                    GhostButton("Open folder", icon = Icons.Default.FolderOpen) {
+                        controller.revealArchive()
+                    }
+                    Spacer(Modifier.width(8.dp))
+                }
+                GhostButton("Dismiss") { controller.dismissArchive() }
             }
         }
+
+        if (controller.archiveRunning) {
+            Spacer(Modifier.height(9.dp))
+            ThinProgress(controller.archiveProgress)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                controller.archiveCurrent,
+                style = MaterialTheme.typography.labelSmall,
+                color = Palette.TextFaint,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        note?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(it, style = MaterialTheme.typography.bodySmall, color = Palette.Accent)
+        }
+        // The path is the point of the feature, so it is spelled out in full
+        // rather than left for the user to go and find.
+        file?.let {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                it.absolutePath,
+                style = MaterialTheme.typography.labelSmall,
+                color = Palette.TextDim
+            )
+        }
+    }
+}
+
+/**
+ * Actions for a multi-track selection.
+ *
+ * Ctrl+click to add one, Shift+click for a run, Ctrl+A for everything on
+ * screen, Escape to drop it - the shortcuts a Windows user already has in their
+ * fingers, so the bar states them rather than teaching them.
+ */
+@Composable
+private fun SelectionBar(controller: DesktopController, visible: List<DesktopTrack>) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(Palette.Selected)
+            .padding(horizontal = 24.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            "${controller.selectedPaths.size} selected",
+            style = MaterialTheme.typography.titleMedium,
+            color = Palette.Text
+        )
+        Spacer(Modifier.width(12.dp))
+        Text(
+            "Ctrl+click to add · Shift+click for a range · Ctrl+A for all · Esc to clear",
+            style = MaterialTheme.typography.labelSmall,
+            color = Palette.TextFaint,
+            modifier = Modifier.weight(1f)
+        )
+
+        GhostButton("Play", icon = Icons.Default.PlayArrow) {
+            controller.playSelection(visible)
+        }
+        Spacer(Modifier.width(6.dp))
+        GhostButton("Favourite", icon = Icons.Default.FavoriteBorder) {
+            controller.favouriteSelection(visible)
+        }
+        Spacer(Modifier.width(6.dp))
+        GhostButton("Zip and ship", icon = Icons.Default.Archive) {
+            controller.zipSelection(visible)
+        }
+        Spacer(Modifier.width(6.dp))
+        GhostButton("Show in Explorer", icon = Icons.Default.FolderOpen) {
+            controller.revealSelection(visible)
+        }
+        Spacer(Modifier.width(6.dp))
+        GhostButton("Delete", icon = Icons.Default.Delete) {
+            controller.deleteSelection(visible)
+        }
+        Spacer(Modifier.width(6.dp))
+        GhostButton("Clear") { controller.clearSelection() }
     }
 }

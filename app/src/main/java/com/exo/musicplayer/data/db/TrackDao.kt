@@ -23,6 +23,25 @@ interface TrackDao {
     )
     fun observeByArtist(): Flow<List<Track>>
 
+    /**
+     * Grouped by album, and within an album by track number where there is one.
+     *
+     * The Windows build has a whole Albums view for this. A sixth tab would
+     * crowd a phone, and sorting the library people already know reaches the
+     * same information, so this is the album view on Android.
+     *
+     * Untagged albums sort last rather than first: a run of blanks at the top
+     * pushes everything that is actually grouped off the screen.
+     */
+    @Query(
+        "SELECT * FROM tracks ORDER BY " +
+            "CASE WHEN album IS NULL OR album = '' THEN 1 ELSE 0 END, " +
+            "album COLLATE NOCASE ASC, " +
+            "CASE WHEN trackNumber IS NULL OR trackNumber = 0 THEN 1 ELSE 0 END, " +
+            "trackNumber ASC, title COLLATE NOCASE ASC"
+    )
+    fun observeByAlbum(): Flow<List<Track>>
+
     @Query("SELECT * FROM tracks ORDER BY durationMs DESC, title COLLATE NOCASE ASC")
     fun observeByDuration(): Flow<List<Track>>
 

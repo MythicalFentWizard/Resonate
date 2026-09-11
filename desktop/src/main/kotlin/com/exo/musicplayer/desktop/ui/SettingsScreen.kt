@@ -20,7 +20,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ColorLens
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
@@ -37,11 +39,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.exo.musicplayer.desktop.AppVersion
 import com.exo.musicplayer.desktop.data.AppDirs
 import com.exo.musicplayer.desktop.data.DesktopController
+import com.exo.musicplayer.desktop.data.ProxyMode
 import com.exo.musicplayer.desktop.system.DuckKey
+import kotlin.math.roundToInt
 import java.awt.Desktop
 import java.io.File
 import java.net.URI
@@ -129,6 +135,8 @@ fun SettingsScreen(controller: DesktopController, onChooseFolder: () -> File?) {
                     modifier = Modifier.weight(1f)
                 )
                 Spacer(Modifier.width(10.dp))
+                GhostButton("Open") { controller.openMusicFolder() }
+                Spacer(Modifier.width(6.dp))
                 GhostButton("Change") {
                     onChooseFolder()?.let { controller.chooseDownloadDir(it) }
                 }
@@ -144,20 +152,111 @@ fun SettingsScreen(controller: DesktopController, onChooseFolder: () -> File?) {
 
         Spacer(Modifier.height(14.dp))
 
+        ProxySettings(controller)
+
+        Spacer(Modifier.height(14.dp))
+
         Panel(Modifier.fillMaxWidth()) {
             SectionTitle("Appearance")
             Spacer(Modifier.height(4.dp))
             Hint(
-                "The window keeps its dark surfaces either way — only the accent moves. " +
-                    "Recolouring the whole shell is what makes a themed app look skinned."
+                "Recolours the whole window, not just the buttons. Each one is a published " +
+                    "scheme - the surfaces and the text tones come from it together, which is " +
+                    "what keeps every label readable on every layer."
             )
             Spacer(Modifier.height(14.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                AccentChoice.entries.forEach { option ->
-                    AccentSwatch(option, option == controller.accent) {
-                        controller.accent = option
+            var editingColours by remember { mutableStateOf(false) }
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                // Fixed-width cells, and the short last row padded out with empty
+                // ones: a swatch used to be as wide as its own label, so "Amethyst"
+                // and "Rose" made different columns and the bottom row sat offset.
+                AccentChoice.entries.chunked(SWATCHES_PER_ROW).forEach { row ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                        row.forEach { option ->
+                            AccentSwatch(option, option == controller.accent) {
+                                controller.accent = option
+                                if (option == AccentChoice.CUSTOM) editingColours = true
+                            }
+                        }
+                        repeat(SWATCHES_PER_ROW - row.size) { Spacer(Modifier.width(SWATCH_CELL)) }
                     }
                 }
+            }
+            Spacer(Modifier.height(8.dp))
+            Hint(controller.accent.credit)
+            Spacer(Modifier.height(12.dp))
+            GhostButton("Edit colours", icon = Icons.Default.ColorLens) { editingColours = true }
+            Spacer(Modifier.height(6.dp))
+            Hint("Theme colours, the background effect's colour, and the lyrics' current and other lines.")
+            if (editingColours) ThemeEditorWindow(controller) { editingColours = false }
+
+            Spacer(Modifier.height(18.dp))
+            Text("Background", style = MaterialTheme.typography.titleMedium, color = Palette.Text)
+            Spacer(Modifier.height(8.dp))
+            SegmentedRow(
+                options = BackdropStyle.entries,
+                selected = controller.backdrop,
+                label = { it.label },
+                onSelect = { controller.backdrop = it }
+            )
+            if (controller.backdrop == BackdropStyle.REACTIVE) {
+                Spacer(Modifier.height(8.dp))
+                SegmentedRow(
+                    options = ReactiveMode.entries,
+                    selected = controller.reactiveMode,
+                    label = { it.label },
+                    onSelect = { controller.reactiveMode = it }
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Hint(
+                if (controller.backdrop == BackdropStyle.NONE) {
+                    controller.backdrop.note
+                } else {
+                    controller.backdrop.note +
+                        (if (controller.backdrop == BackdropStyle.REACTIVE) " " + controller.reactiveMode.note else "") +
+                        " Shown behind the sidebar, the library and the " +
+                        "lyrics, and paused while the window isn't focused."
+                }
+            )
+
+            Spacer(Modifier.height(18.dp))
+            Text("Wallpaper", style = MaterialTheme.typography.titleMedium, color = Palette.Text)
+            Spacer(Modifier.height(4.dp))
+            Hint("A picture of your own behind everything, with the background effect drawn over it.")
+            Spacer(Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                GhostButton(
+                    if (controller.wallpaper == null) "Choose picture" else "Change picture",
+                    icon = Icons.Default.Image
+                ) { chooseImage()?.let { controller.setWallpaper(it) } }
+                if (controller.wallpaper != null) {
+                    Spacer(Modifier.width(8.dp))
+                    GhostButton("Remove") { controller.clearWallpaper() }
+                }
+            }
+            controller.wallpaperNote?.let { note ->
+                Spacer(Modifier.height(6.dp))
+                Hint(note)
+            }
+            if (controller.wallpaper != null) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "Dim ${(controller.wallpaperDim * 100).roundToInt()}%",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Palette.TextDim
+                )
+                Slider(
+                    value = controller.wallpaperDim,
+                    onValueChange = { controller.wallpaperDim = it },
+                    valueRange = 0f..0.9f,
+                    colors = SliderDefaults.colors(
+                        thumbColor = Palette.Accent,
+                        activeTrackColor = Palette.Accent,
+                        inactiveTrackColor = Palette.Line
+                    )
+                )
+                Hint("Darkens the picture so text stays easy to read.")
             }
         }
 
@@ -255,7 +354,7 @@ fun SettingsScreen(controller: DesktopController, onChooseFolder: () -> File?) {
                         style = MaterialTheme.typography.bodyMedium,
                         color = Palette.Text
                     )
-                    Hint("made by lucent")
+                    Hint("version ${AppVersion.name} · made by lucent")
                 }
                 GhostButton("Contact") { openLink("https://t.me/Eth4wn") }
             }
@@ -285,12 +384,15 @@ fun SettingsScreen(controller: DesktopController, onChooseFolder: () -> File?) {
 
 @Composable
 private fun AccentSwatch(choice: AccentChoice, selected: Boolean, onClick: () -> Unit) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+    Column(
+        Modifier.width(SWATCH_CELL),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
         Box(
             Modifier
                 .size(40.dp)
                 .clip(RoundedCornerShape(9.dp))
-                .background(choice.accent)
+                .background(if (choice == AccentChoice.CUSTOM) Palette.custom.accent else choice.accent)
                 .border(
                     2.dp,
                     if (selected) Palette.Text else Color.Transparent,
@@ -300,17 +402,24 @@ private fun AccentSwatch(choice: AccentChoice, selected: Boolean, onClick: () ->
             contentAlignment = Alignment.Center
         ) {
             if (selected) {
-                Icon(Icons.Default.Check, null, Modifier.size(17.dp), tint = choice.onAccent)
+                Icon(Icons.Default.Check, null, Modifier.size(17.dp), tint = if (choice == AccentChoice.CUSTOM) Palette.custom.onAccent else choice.onAccent)
             }
         }
         Spacer(Modifier.height(6.dp))
         Text(
             choice.label,
             style = MaterialTheme.typography.labelSmall,
-            color = if (selected) Palette.Text else Palette.TextFaint
+            color = if (selected) Palette.Text else Palette.TextFaint,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center
         )
     }
 }
+
+/** Every swatch takes the same width, whatever its name is, so the rows line up. */
+private val SWATCH_CELL = 78.dp
+private const val SWATCHES_PER_ROW = 6
 
 @Composable
 private fun WeatherSettings(controller: DesktopController) {
@@ -408,4 +517,90 @@ private fun openFolder(dir: File) {
             Desktop.getDesktop().open(dir)
         }
     }
+}
+
+/**
+ * The proxy for everything Resonate does online.
+ *
+ * One address box and one port box rather than a URL field: the kind of proxy
+ * is already chosen above it, and a pasted "socks5://" would only be something
+ * to strip back off.
+ */
+@Composable
+private fun ProxySettings(controller: DesktopController) {
+    val proxy = controller.proxy
+    Panel(Modifier.fillMaxWidth()) {
+        SectionTitle("Proxy")
+        Spacer(Modifier.height(4.dp))
+        Hint(
+            "Used for everything that goes online: yt-dlp and spotdl downloads, YouTube " +
+                "search and previews, lyrics, cover art, identification and weather."
+        )
+        Spacer(Modifier.height(12.dp))
+        SegmentedRow(
+            options = ProxyMode.entries,
+            selected = proxy.mode,
+            label = { it.label },
+            onSelect = { controller.proxy = controller.proxy.copy(mode = it) }
+        )
+        Spacer(Modifier.height(10.dp))
+        when (proxy.mode) {
+            ProxyMode.SYSTEM ->
+                Hint("Follows Windows: Settings, Network & internet, Proxy.")
+            ProxyMode.DIRECT ->
+                Hint("Connects straight to the internet, even if Windows has a proxy set.")
+            else -> {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextInput(
+                        value = proxy.host,
+                        onValueChange = { controller.proxy = controller.proxy.copy(host = it.trim()) },
+                        placeholder = "Address, like 127.0.0.1",
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    TextInput(
+                        value = if (proxy.port == 0) "" else proxy.port.toString(),
+                        onValueChange = { typed ->
+                            val digits = typed.filter { it.isDigit() }.take(5)
+                            controller.proxy = controller.proxy.copy(port = digits.toIntOrNull() ?: 0)
+                        },
+                        placeholder = "Port",
+                        modifier = Modifier.width(110.dp)
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                Hint(
+                    when {
+                        proxy.port > 65535 ->
+                            "Ports go up to 65535. Until then Resonate connects directly."
+                        proxy.incomplete ->
+                            "Fill in both the address and the port. Until then Resonate connects directly."
+                        proxy.mode == ProxyMode.HTTPS ->
+                            "Reaches the proxy the same way as HTTP and tunnels secure sites through it."
+                        proxy.mode == ProxyMode.SOCKS5 ->
+                            "Recommended: carries every kind of connection Resonate makes."
+                        else ->
+                            "Applied straight away to every new connection."
+                    }
+                )
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            GhostButton("Test connection") { controller.testProxy() }
+            controller.proxyTestNote?.let { note ->
+                Spacer(Modifier.width(10.dp))
+                Text(note, style = MaterialTheme.typography.bodySmall, color = Palette.TextDim)
+            }
+        }
+    }
+}
+
+/** Windows' own open dialog, filtered to pictures. */
+private fun chooseImage(): File? {
+    val dialog = java.awt.FileDialog(null as java.awt.Frame?, "Choose a wallpaper", java.awt.FileDialog.LOAD)
+    dialog.file = "*.jpg;*.jpeg;*.png;*.webp;*.bmp"
+    dialog.isVisible = true
+    val name = dialog.file ?: return null
+    return File(dialog.directory, name)
 }

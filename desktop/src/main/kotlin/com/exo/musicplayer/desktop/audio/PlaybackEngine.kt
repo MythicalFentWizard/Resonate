@@ -1,10 +1,10 @@
 package com.exo.musicplayer.desktop.audio
 
+import com.exo.musicplayer.data.audio.SpectrumAnalyser
 import com.exo.musicplayer.desktop.library.DesktopTrack
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.io.File
 import javax.sound.sampled.SourceDataLine
 import kotlin.concurrent.thread
 
@@ -41,6 +41,12 @@ class PlaybackEngine {
 
     val effects = EffectChain()
 
+    /** Band levels for the mixer display; idle unless something is showing it. */
+    val spectrum = SpectrumAnalyser()
+
+    /** The bass as it reaches the speakers, for the reactive backgrounds. */
+    val beat = BeatTap()
+
     private var worker: Thread? = null
     private var lines = listOf<SourceDataLine>()
     private var outputs = listOf<DesktopAudioOutput>()
@@ -68,9 +74,15 @@ class PlaybackEngine {
         framesPlayed = 0
         lastPublished = -1
         effects.reset()
+        spectrum.reset()
+        beat.reset()
         _status.value = PlaybackStatus(track = track, playing = true, durationMs = track.durationMs)
 
-        worker = thread(name = "resonate-playback", isDaemon = true) { run(track) }
+        // Above normal priority: a playback thread that loses its time slice to
+        // the UI thread is an audible gap, and it does very little per wake-up.
+        worker = thread(name = "resonate-playback", isDaemon = true, priority = Thread.MAX_PRIORITY) {
+            run(track)
+        }
     }
 
     fun togglePlay() {
@@ -84,6 +96,7 @@ class PlaybackEngine {
     fun stop() {
         stopRequested = true
         playing = false
+        spectrum.reset()
         worker?.join(600)
         worker = null
         closeLines()
@@ -95,7 +108,7 @@ class PlaybackEngine {
     private fun run(track: DesktopTrack) {
         var decoder: Decoder? = null
         try {
-            decoder = Decoder(track.file)
+            decoder = Decoder.open(track.file)
             reopenLines()
             if (lines.isEmpty()) {
                 _status.value = _status.value.copy(
@@ -113,47 +126,37 @@ class PlaybackEngine {
                     outputsDirty = false
                     reopenLines()
                 }
-                if (!playing) { Thread.sleep(40); continue }
 
+                // Handled before the pause check, so a seek made while paused
+                // moves the position straight away rather than on resume.
                 seekToMs?.let { target ->
                     seekToMs = null
-                    // Compressed streams have no cheap random access, so the
-                    // file is reopened and decoded forward to the target.
-                    runCatching { decoder?.close() }
-                    decoder = Decoder(track.file)
-                    var skipped = 0L
-                    val wanted = target * rate / 1000
-                    while (skipped < wanted) {
-                        val chunk = decoder?.read(8192) ?: break
-                        skipped += chunk.size / 2
-                    }
-                    framesPlayed = wanted
+                    decoder = seek(decoder, track, target * rate / 1000)
+                    framesPlayed = decoder?.positionFrames ?: 0L
                     effects.reset()
+                    spectrum.reset()
+                    beat.reset()
+                    // Drops what is already queued at the old position. Without
+                    // it, up to a fifth of a second of the old spot still plays
+                    // after the jump, which is what makes a seek feel sluggish.
+                    lines.forEach { runCatching { it.flush() } }
+                    publishPosition(duration, rate, force = true)
                 }
 
-                val raw = decoder?.read(4096)
-                if (raw == null) break
+                if (!playing) { Thread.sleep(40); continue }
+
+                val raw = decoder?.read(4096) ?: break
 
                 val processed = effects.process(raw)
-                if (processed.isEmpty()) continue
-
-                val bytes = toBytes(processed)
-                writeToAll(bytes)
-
                 framesPlayed += raw.size / 2
-                val positionMs = framesPlayed * 1000 / rate
+                if (processed.isEmpty()) continue
+                // After the chain, so speed, pitch and reverb are all visible
+                // in the meter rather than it showing the untouched source.
+                spectrum.feed(processed)
+                beat.feed(processed, queuedFrames(), rate)
 
-                // Published four times a second rather than once per buffer.
-                // Every emission recomposes the transport bar and repaints a
-                // frame, and at ~11 buffers a second that was an order of
-                // magnitude more redrawing than a 3px progress bar can show.
-                if (positionMs / PUBLISH_INTERVAL_MS != lastPublished) {
-                    lastPublished = positionMs / PUBLISH_INTERVAL_MS
-                    _status.value = _status.value.copy(
-                        positionMs = positionMs,
-                        durationMs = if (duration > 0) duration else positionMs
-                    )
-                }
+                writeToAll(toBytes(processed))
+                publishPosition(duration, rate)
             }
         } catch (t: Throwable) {
             _status.value = _status.value.copy(
@@ -167,6 +170,46 @@ class PlaybackEngine {
             }
         }
     }
+
+    /**
+     * Moves playback to [frame], reopening the file only when that is behind the
+     * decoder.
+     *
+     * Forward is the common case, a click a little further along, and carrying on
+     * from where the decoder already is avoids passing over the start of the file
+     * again. A compressed stream cannot go backwards, so that reopens.
+     */
+    private fun seek(current: Decoder?, track: DesktopTrack, frame: Long): Decoder? {
+        if (current != null && frame >= current.positionFrames) {
+            current.skip(frame - current.positionFrames)
+            return current
+        }
+        runCatching { current?.close() }
+        return Decoder.open(track.file, frame)
+    }
+
+    /**
+     * Published four times a second rather than once per buffer. Every emission
+     * recomposes the transport bar and repaints a frame, and at about eleven
+     * buffers a second that was an order of magnitude more redrawing than a 3px
+     * progress bar can show.
+     */
+    private fun publishPosition(duration: Long, rate: Int, force: Boolean = false) {
+        val positionMs = framesPlayed * 1000 / rate
+        val slot = positionMs / PUBLISH_INTERVAL_MS
+        if (!force && slot == lastPublished) return
+        lastPublished = slot
+        _status.value = _status.value.copy(
+            positionMs = positionMs,
+            durationMs = if (duration > 0) duration else positionMs
+        )
+    }
+
+    /** Frames handed to the primary line that it has not played yet. */
+    private fun queuedFrames(): Int = runCatching {
+        val line = lines.firstOrNull() ?: return 0
+        (line.bufferSize - line.available()) / line.format.frameSize
+    }.getOrDefault(0)
 
     private fun writeToAll(bytes: ByteArray) {
         val current = lines

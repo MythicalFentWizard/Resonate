@@ -31,6 +31,14 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.activity.compose.BackHandler
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.Surface
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -72,7 +80,16 @@ fun LibraryScreen(
     onAddToPlaylist: (Track) -> Unit,
     onToggleFavorite: (Track) -> Unit,
     onFixTags: (Track) -> Unit,
+    onEditDetails: (Track) -> Unit,
     onDelete: (Track) -> Unit,
+    selectedIds: Set<Long>,
+    onToggleSelect: (Track) -> Unit,
+    onClearSelection: () -> Unit,
+    onSelectAll: () -> Unit,
+    onShareSelected: () -> Unit,
+    onPlaylistSelected: () -> Unit,
+    onFavoriteSelected: () -> Unit,
+    onDeleteSelected: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var searchOpen by remember { mutableStateOf(false) }
@@ -84,7 +101,26 @@ fun LibraryScreen(
         return
     }
 
+    val selecting = selectedIds.isNotEmpty()
+
+    // Leaving selection with the back gesture, which is what the gesture is
+    // for. Without this, back would leave the screen and abandon a selection
+    // the user can no longer see.
+    BackHandler(enabled = selecting, onBack = onClearSelection)
+
     Column(modifier.fillMaxSize()) {
+        if (selecting) {
+            SelectionBar(
+                count = selectedIds.size,
+                total = shown.size,
+                onClear = onClearSelection,
+                onSelectAll = onSelectAll,
+                onShare = onShareSelected,
+                onPlaylist = onPlaylistSelected,
+                onFavorite = onFavoriteSelected,
+                onDelete = onDeleteSelected
+            )
+        }
         Row(
             Modifier
                 .fillMaxWidth()
@@ -170,13 +206,21 @@ fun LibraryScreen(
                     track = track,
                     isCurrent = track.id == currentTrackId,
                     isPlaying = isPlaying,
-                    onClick = { onPlayFrom(shown, index) },
+                    // Once a selection exists, tapping extends it rather than
+                    // starting playback - otherwise picking a second song
+                    // would throw the first away.
+                    onClick = {
+                        if (selecting) onToggleSelect(track) else onPlayFrom(shown, index)
+                    },
                     onPlayNext = { onPlayNext(track) },
                     onAddToQueue = { onAddToQueue(track) },
                     onAddToPlaylist = { onAddToPlaylist(track) },
                     onToggleFavorite = { onToggleFavorite(track) },
                     onFixTags = { onFixTags(track) },
-                    onDelete = { onDelete(track) }
+                                onEditDetails = { onEditDetails(track) },
+                    onDelete = { onDelete(track) },
+                    isSelected = track.id in selectedIds,
+                    onLongPress = { onToggleSelect(track) }
                 )
             }
             item { Spacer(Modifier.height(16.dp)) }
@@ -292,6 +336,64 @@ private fun EmptyLibrary(
                 Icon(Icons.Default.FolderOpen, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
                 Text("Import folder")
+            }
+        }
+    }
+}
+
+/**
+ * Actions for a multi-track selection.
+ *
+ * Sits above the normal header rather than replacing it, so the library title
+ * and count stay visible and it is obvious the selection is a mode you are in
+ * rather than a different screen.
+ */
+@Composable
+private fun SelectionBar(
+    count: Int,
+    total: Int,
+    onClear: () -> Unit,
+    onSelectAll: () -> Unit,
+    onShare: () -> Unit,
+    onPlaylist: () -> Unit,
+    onFavorite: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.primaryContainer,
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            Modifier.padding(start = 4.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onClear) {
+                Icon(Icons.Default.Close, contentDescription = "Cancel selection")
+            }
+            Text(
+                text = "$count selected",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            if (count < total) {
+                TextButton(onClick = onSelectAll) { Text("All") }
+            }
+            IconButton(onClick = onShare) {
+                Icon(Icons.Default.Share, contentDescription = "Share selected")
+            }
+            IconButton(onClick = onPlaylist) {
+                Icon(
+                    Icons.AutoMirrored.Filled.PlaylistAdd,
+                    contentDescription = "Add selected to a playlist"
+                )
+            }
+            IconButton(onClick = onFavorite) {
+                Icon(Icons.Default.FavoriteBorder, contentDescription = "Favourite selected")
+            }
+            IconButton(onClick = onDelete) {
+                Icon(Icons.Default.Delete, contentDescription = "Delete selected")
             }
         }
     }

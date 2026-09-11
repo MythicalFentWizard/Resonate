@@ -3,6 +3,7 @@ package com.exo.musicplayer.desktop.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
@@ -13,9 +14,11 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
@@ -49,6 +52,12 @@ import androidx.compose.ui.unit.dp
  * layout is exactly what makes a port look like a port.
  */
 
+/**
+ * Buttons and text fields share one height, so a button beside a field lines up
+ * with it instead of sitting a few pixels short.
+ */
+private val CONTROL_HEIGHT = 34.dp
+
 @Composable
 fun AccentButton(
     label: String,
@@ -61,21 +70,22 @@ fun AccentButton(
     val background = when {
         !enabled -> Palette.Hover
         hovered -> Palette.Accent
-        else -> Palette.AccentSoft
+        else -> Palette.Button
     }
     Row(
         Modifier
+            .heightIn(min = CONTROL_HEIGHT)
             .clip(RoundedCornerShape(7.dp))
             .background(background)
             .hoverable(interaction)
             .clickable(enabled = enabled) { onClick() }
-            .padding(horizontal = 16.dp, vertical = 9.dp),
+            .padding(horizontal = 16.dp, vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         val tint = when {
             !enabled -> Palette.TextFaint
             hovered -> Palette.OnAccent
-            else -> Palette.Text
+            else -> Palette.OnButton
         }
         if (icon != null) {
             Icon(icon, null, Modifier.size(15.dp), tint = tint)
@@ -101,12 +111,13 @@ fun GhostButton(
     val hovered by interaction.collectIsHoveredAsState()
     Row(
         Modifier
+            .heightIn(min = CONTROL_HEIGHT)
             .clip(RoundedCornerShape(7.dp))
             .background(if (hovered && enabled) Palette.Hover else Color.Transparent)
             .border(1.dp, Palette.Line, RoundedCornerShape(7.dp))
             .hoverable(interaction)
             .clickable(enabled = enabled) { onClick() }
-            .padding(horizontal = 14.dp, vertical = 8.dp),
+            .padding(horizontal = 14.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         val tint = if (enabled) Palette.TextDim else Palette.TextFaint
@@ -114,7 +125,14 @@ fun GhostButton(
             Icon(icon, null, Modifier.size(14.dp), tint = tint)
             Spacer(Modifier.width(7.dp))
         }
-        Text(label, style = MaterialTheme.typography.bodySmall, color = tint)
+        Text(
+            label,
+            style = MaterialTheme.typography.bodySmall,
+            color = tint,
+            // A squeezed Row would otherwise break this one character per line.
+            maxLines = 1,
+            softWrap = false
+        )
     }
 }
 
@@ -170,10 +188,11 @@ fun TextInput(
 ) {
     Row(
         modifier
+            .heightIn(min = CONTROL_HEIGHT)
             .clip(RoundedCornerShape(7.dp))
             .background(Palette.Content)
             .border(1.dp, Palette.Line, RoundedCornerShape(7.dp))
-            .padding(horizontal = 11.dp, vertical = 9.dp),
+            .padding(horizontal = 11.dp, vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (leading != null) {
@@ -242,8 +261,10 @@ fun CheckRow(
                 .clip(RoundedCornerShape(4.dp))
                 .background(if (checked) Palette.Accent else Color.Transparent)
                 .border(
-                    1.dp,
-                    if (checked) Palette.Accent else Palette.Line,
+                    1.5.dp,
+                    // The line colour disappeared into the panel; an empty box has
+                    // to be seen to be clicked.
+                    if (checked) Palette.Accent else Palette.TextFaint,
                     RoundedCornerShape(4.dp)
                 ),
             contentAlignment = Alignment.Center

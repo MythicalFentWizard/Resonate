@@ -118,5 +118,24 @@
             </intent-filter>
         </service>
 
+
+        <!--
+            Lets other apps read tracks we hand them.
+
+            Imported files sit in app-private storage, so a file:// path is
+            unreadable to anything else and would throw FileUriExposedException
+            besides. The share intent grants read access per URI instead, and
+            that grant expires with the receiving activity - nothing gains
+            standing access to the library.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.shared"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/shared_paths" />
+        </provider>
     </application>
 </manifest>

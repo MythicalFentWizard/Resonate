@@ -57,15 +57,25 @@ class PlaybackConnection(
     val state: StateFlow<PlaybackState> = _state.asStateFlow()
 
     private val listener = object : Player.Listener {
-        override fun onEvents(player: Player, events: Player.Events) = publish()
+        override fun onEvents(player: Player, events: Player.Events) {
+            // Any real player event may have changed the queue; a position tick
+            // never does, which is what the cache below exists to exploit.
+            queueDirty = true
+            publish()
+        }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             mediaItem?.trackId()?.let(onTrackStarted)
+            // Media3 fires this before onEvents, so without marking the queue
+            // stale here this call would publish the previous one for an
+            // instant before onEvents corrected it.
+            queueDirty = true
             publish()
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (isPlaying) startTicker() else stopTicker()
+            queueDirty = true
             publish()
         }
     }
@@ -212,15 +222,36 @@ class PlaybackConnection(
         onPlaybackPaused()
     }
 
+    /**
+     * The queue, rebuilt only when something has actually changed it.
+     *
+     * [publish] runs twice a second for the whole time anything is playing, and
+     * it used to walk every item in the queue and allocate a fresh list on each
+     * pass - thousands of calls a second on a large queue, to produce the same
+     * answer every time. A position tick cannot reorder the queue, so the list
+     * is cached and only recomputed when a player event says it may have moved.
+     */
+    private var cachedQueue: List<Long> = emptyList()
+    private var queueDirty = true
+
+    private fun queueOf(player: Player): List<Long> {
+        if (!queueDirty) return cachedQueue
+        cachedQueue = (0 until player.mediaItemCount).mapNotNull {
+            player.getMediaItemAt(it).trackId()
+        }
+        queueDirty = false
+        return cachedQueue
+    }
+
     private fun publish() {
         val player = controller
         if (player == null) {
             _state.value = PlaybackState()
+            cachedQueue = emptyList()
+            queueDirty = true
             return
         }
-        val queue = (0 until player.mediaItemCount).mapNotNull {
-            player.getMediaItemAt(it).trackId()
-        }
+        val queue = queueOf(player)
         _state.value = PlaybackState(
             isConnected = true,
             currentTrackId = player.currentMediaItem?.trackId(),

@@ -74,7 +74,7 @@ fun SoundScreen(
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp),
+                .padding(horizontal = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             InterruptionBehavior.entries.forEach { behavior ->

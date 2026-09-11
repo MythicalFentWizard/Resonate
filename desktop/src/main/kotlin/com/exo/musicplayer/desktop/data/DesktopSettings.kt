@@ -82,6 +82,63 @@ class DesktopSettings {
         get() = prefs.getBoolean(KEY_WRITE_TAGS, true)
         set(value) = prefs.putBoolean(KEY_WRITE_TAGS, value)
 
+    /** On by default, as it is on the phone. */
+    var starryBackground: Boolean
+        get() = prefs.getBoolean(KEY_STARS, true)
+        set(value) = prefs.putBoolean(KEY_STARS, value)
+
+    /** A BackdropStyle name; until one is chosen, whatever the old starry switch said. */
+    var backdrop: String
+        get() = prefs.get(KEY_BACKDROP, null) ?: if (starryBackground) "STARS" else "NONE"
+        set(value) = prefs.put(KEY_BACKDROP, value)
+
+    /** A ReactiveMode name. */
+    var reactiveMode: String
+        get() = prefs.get(KEY_REACTIVE_MODE, "BALL")
+        set(value) = prefs.put(KEY_REACTIVE_MODE, value)
+
+    /** The Custom theme as ARGB hex, "primary,secondary,tertiary,button"; empty until edited. */
+    var customTheme: String
+        get() = prefs.get(KEY_CUSTOM_THEME, "")
+        set(value) = prefs.put(KEY_CUSTOM_THEME, value)
+
+    /** ARGB hex for the background effect, or empty to follow the theme. */
+    var backdropColor: String
+        get() = prefs.get(KEY_BACKDROP_COLOR, "")
+        set(value) = prefs.put(KEY_BACKDROP_COLOR, value)
+
+    /** Whether a wallpaper is set; the picture itself is kept in Resonate's own folder. */
+    var hasWallpaper: Boolean
+        get() = prefs.getBoolean(KEY_WALLPAPER, false)
+        set(value) = prefs.putBoolean(KEY_WALLPAPER, value)
+
+    var wallpaperDim: Float
+        get() = prefs.getFloat(KEY_WALLPAPER_DIM, 0.55f)
+        set(value) = prefs.putFloat(KEY_WALLPAPER_DIM, value)
+
+    /** ARGB hex for the lyric line being sung, or empty to follow the theme. */
+    var lyricsActiveColor: String
+        get() = prefs.get(KEY_LYRICS_ACTIVE, "")
+        set(value) = prefs.put(KEY_LYRICS_ACTIVE, value)
+
+    /** ARGB hex for the other lyric lines, or empty to follow the theme. */
+    var lyricsInactiveColor: String
+        get() = prefs.get(KEY_LYRICS_INACTIVE, "")
+        set(value) = prefs.put(KEY_LYRICS_INACTIVE, value)
+
+    /** A ProxyMode name. System by default, which is how Resonate behaved before there was a choice. */
+    var proxyMode: String
+        get() = prefs.get(KEY_PROXY_MODE, "SYSTEM")
+        set(value) = prefs.put(KEY_PROXY_MODE, value)
+
+    var proxyHost: String
+        get() = prefs.get(KEY_PROXY_HOST, "")
+        set(value) = prefs.put(KEY_PROXY_HOST, value)
+
+    var proxyPort: Int
+        get() = prefs.getInt(KEY_PROXY_PORT, 0)
+        set(value) = prefs.putInt(KEY_PROXY_PORT, value)
+
     private companion object {
         const val KEY_FOLDERS = "library_folders"
         const val KEY_OUTPUTS = "audio_outputs"
@@ -96,5 +153,17 @@ class DesktopSettings {
         const val KEY_DUCK_ENABLED = "duck_enabled"
         const val KEY_DUCK_KEY = "duck_key"
         const val KEY_DUCK_PERCENT = "duck_percent"
+        const val KEY_STARS = "starry_background"
+        const val KEY_BACKDROP = "backdrop_style"
+        const val KEY_REACTIVE_MODE = "reactive_mode"
+        const val KEY_CUSTOM_THEME = "custom_theme"
+        const val KEY_BACKDROP_COLOR = "backdrop_color"
+        const val KEY_WALLPAPER = "wallpaper"
+        const val KEY_WALLPAPER_DIM = "wallpaper_dim"
+        const val KEY_LYRICS_ACTIVE = "lyrics_active_color"
+        const val KEY_LYRICS_INACTIVE = "lyrics_inactive_color"
+        const val KEY_PROXY_MODE = "proxy_mode"
+        const val KEY_PROXY_HOST = "proxy_host"
+        const val KEY_PROXY_PORT = "proxy_port"
     }
 }

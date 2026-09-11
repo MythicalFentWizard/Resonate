@@ -5,6 +5,10 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import com.exo.musicplayer.data.archive.ArchiveEntry
+import com.exo.musicplayer.data.archive.MusicArchive
 import com.exo.musicplayer.data.download.DownloadQuality
 import com.exo.musicplayer.data.download.LinkResolver
 import com.exo.musicplayer.data.download.ResolvedLink
@@ -42,22 +46,40 @@ import com.exo.musicplayer.desktop.audio.AudioDevices
 import com.exo.musicplayer.desktop.audio.DesktopAudioOutput
 import com.exo.musicplayer.desktop.audio.MediaAudio
 import com.exo.musicplayer.desktop.audio.SampleOutcome
+import com.exo.musicplayer.data.youtube.PipedYouTubeBackend
+import com.exo.musicplayer.data.youtube.YouTubeFormat
+import com.exo.musicplayer.data.youtube.YouTubeLinkFinder
+import com.exo.musicplayer.data.youtube.YouTubeSearch
+import com.exo.musicplayer.data.youtube.YouTubeVideo
+import com.exo.musicplayer.desktop.audio.PreviewPlayer
+import com.exo.musicplayer.desktop.audio.SongGraph
+import com.exo.musicplayer.desktop.download.DesktopYouTubeBackend
 import com.exo.musicplayer.desktop.audio.PlaybackEngine
 import com.exo.musicplayer.desktop.download.DownloadProgress
 import com.exo.musicplayer.desktop.download.ToolStatus
 import com.exo.musicplayer.desktop.download.YtDlp
 import com.exo.musicplayer.desktop.system.DuckKey
+import com.exo.musicplayer.desktop.system.Explorer
 import com.exo.musicplayer.desktop.system.GlobalHotkey
 import com.exo.musicplayer.desktop.library.DesktopTrack
 import com.exo.musicplayer.desktop.library.FolderLibrary
 import com.exo.musicplayer.desktop.ui.AccentChoice
+import com.exo.musicplayer.desktop.ui.BackdropStyle
 import com.exo.musicplayer.desktop.ui.DesktopFxState
 import com.exo.musicplayer.desktop.ui.Palette
+import com.exo.musicplayer.desktop.ui.ReactiveMode
 import com.exo.musicplayer.desktop.ui.SidePanelKind
+import com.exo.musicplayer.desktop.ui.ThemeColors
+import com.exo.musicplayer.util.AudioTypes
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -81,6 +103,7 @@ data class BulkJob(
     val total: Int = 0,
     val done: Int = 0,
     val updated: Int = 0,
+    val alreadyHad: Int = 0,
     val skipped: Int = 0,
     val failed: Int = 0,
     val current: String = "",
@@ -118,13 +141,44 @@ data class DesktopDuplicateGroup(val keep: DesktopTrack, val remove: List<Deskto
  * written from the caller's (main) dispatcher.
  */
 @Stable
-class DesktopController(private val scope: CoroutineScope) {
+class DesktopController(parent: CoroutineScope) {
+
+    /**
+     * The controller's own scope, supervised.
+     *
+     * Everything in here is launched from it. As a plain child of the window's
+     * scope, the first job to throw - an unreadable file, a service dying
+     * mid-call - cancelled that scope, and with it every later scan, lyric
+     * fetch, download and identification, silently, until the app was
+     * restarted. Supervised, a failure stays where it happened, and the handler
+     * clears whatever was marked as running so nothing is left spinning for
+     * work that has died.
+     */
+    private val scope = CoroutineScope(
+        parent.coroutineContext +
+            SupervisorJob(parent.coroutineContext[Job]) +
+            CoroutineExceptionHandler { _, error ->
+                scanning = false
+                lyricsLoading = false
+                youtubeBusy = false
+                identifyBusy = false
+                merging = false
+                System.err.println("Resonate: a background job failed: ${error.stackTraceToString()}")
+            }
+    )
 
     val settings = DesktopSettings()
     val store = DesktopStore(AppDirs.database)
     val engine = PlaybackEngine()
 
+    /** The playing song read ahead, for the Waves background. */
+    val songGraph = SongGraph(engine)
+
     init {
+        ThemeColors.decode(settings.customTheme)?.let(Palette::setCustom)
+        Palette.setStars(ThemeColors.parse(settings.backdropColor))
+        Palette.setLyricsActive(ThemeColors.parse(settings.lyricsActiveColor))
+        Palette.setLyricsInactive(ThemeColors.parse(settings.lyricsInactiveColor))
         Palette.use(AccentChoice.fromName(settings.accentName))
     }
 
@@ -143,6 +197,23 @@ class DesktopController(private val scope: CoroutineScope) {
             InternetArchiveProvider(),
             YouTubeSearchProvider(),
             GeniusMetadataProvider()
+        )
+    )
+
+    /**
+     * Where the bulk cover and tag tools look, best first: YouTube, then the
+     * stores and the other free catalogues, and MusicBrainz last - its search
+     * answers loosely and most of its cover links are dead. Internet Archive is
+     * left out, since its results carry neither art nor an album.
+     */
+    private val libraryLookup = MetadataProviderChain(
+        listOf(
+            YouTubeSearchProvider(),
+            ITunesProvider(),
+            DeezerProvider(),
+            AudiusProvider(),
+            GeniusMetadataProvider(),
+            MusicBrainzProvider()
         )
     )
 
@@ -243,8 +314,32 @@ class DesktopController(private val scope: CoroutineScope) {
         rescan()
     }
 
+    /**
+     * Adds freshly downloaded files to the library straight away.
+     *
+     * Downloads used to appear only when the download folder happened to sit
+     * inside a library folder, which by default it does not. Reading just the new
+     * files also spares re-reading every tag in the library after each download.
+     */
+    private fun addToLibrary(files: List<File>) {
+        if (files.isEmpty()) return
+        scope.launch {
+            val added = FolderLibrary.readFiles(files)
+            if (added.isEmpty()) return@launch
+            val paths = added.map { it.file.absolutePath }.toSet()
+            tracks = (tracks.filterNot { it.file.absolutePath in paths } + added)
+                .sortedWith(compareBy({ it.displayArtist.lowercase() }, { it.title.lowercase() }))
+            refreshAggregates()
+        }
+    }
+
     fun rescan() {
-        val roots = folders.map(::File).filter { it.isDirectory }
+        // The download folder always counts, so anything downloaded is in the
+        // library whether or not that folder was ever added by hand.
+        val roots = (folders + settings.downloadDir)
+            .map(::File)
+            .filter { it.isDirectory }
+            .distinctBy { it.absoluteFile.normalize().path.lowercase() }
         if (roots.isEmpty()) {
             tracks = emptyList()
             scanning = false
@@ -295,6 +390,8 @@ class DesktopController(private val scope: CoroutineScope) {
             engine.effects.reverb.enabled = value.reverbEnabled
             engine.effects.reverb.mix = value.reverbMix
             engine.effects.reverb.decay = value.reverbDecay
+            engine.effects.equalizer.enabled = value.eqEnabled
+            engine.effects.equalizer.setGains(value.eqGains)
         }
 
     private val volumeState = mutableStateOf(settings.volume)
@@ -402,7 +499,258 @@ class DesktopController(private val scope: CoroutineScope) {
             settings.accentName = value.name
         }
 
+    private val backdropState = mutableStateOf(BackdropStyle.fromName(settings.backdrop))
+
+    /** What is drawn behind the sidebar, the library and the lyrics. */
+    var backdrop: BackdropStyle
+        get() = backdropState.value
+        set(value) {
+            backdropState.value = value
+            settings.backdrop = value.name
+        }
+
+    private val reactiveModeState = mutableStateOf(ReactiveMode.fromName(settings.reactiveMode))
+
+    /** Which of Reactive's two looks is shown. */
+    var reactiveMode: ReactiveMode
+        get() = reactiveModeState.value
+        set(value) {
+            reactiveModeState.value = value
+            settings.reactiveMode = value.name
+        }
+
+    /** Lyrics popped out into a window of their own. */
+    var lyricsDetached by mutableStateOf(false)
+
+    /** Stores the Custom theme and switches to it. */
+    fun saveCustomTheme(colors: ThemeColors) {
+        Palette.setCustom(colors)
+        settings.customTheme = colors.encode()
+        accent = AccentChoice.CUSTOM
+    }
+
+    /** The background effect's own colour, or null to follow the theme. */
+    fun setBackdropColor(color: Color?) {
+        Palette.setStars(color)
+        settings.backdropColor = color?.let { ThemeColors.hex(it) }.orEmpty()
+    }
+
+    /** The lyric line being sung, or null to follow the theme. */
+    fun setLyricsActiveColor(color: Color?) {
+        Palette.setLyricsActive(color)
+        settings.lyricsActiveColor = color?.let { ThemeColors.hex(it) }.orEmpty()
+    }
+
+    /** The other lyric lines, or null to follow the theme. */
+    fun setLyricsInactiveColor(color: Color?) {
+        Palette.setLyricsInactive(color)
+        settings.lyricsInactiveColor = color?.let { ThemeColors.hex(it) }.orEmpty()
+    }
+
+    // ---- Wallpaper ----------------------------------------------------------
+
+    /** The user's own background picture, scaled to screen size; null for none. */
+    var wallpaper by mutableStateOf<ImageBitmap?>(null)
+        private set
+
+    private val wallpaperDimState = mutableStateOf(settings.wallpaperDim)
+
+    /** How far the picture is darkened under everything, 0 to 0.9. */
+    var wallpaperDim: Float
+        get() = wallpaperDimState.value
+        set(value) {
+            wallpaperDimState.value = value.coerceIn(0f, 0.9f)
+            settings.wallpaperDim = wallpaperDimState.value
+        }
+
+    var wallpaperNote by mutableStateOf<String?>(null)
+        private set
+
+    /** Resonate's own copy, so moving or deleting the original doesn't take the wallpaper with it. */
+    private val wallpaperFile: File get() = File(AppDirs.root, "wallpaper.img")
+
+    fun setWallpaper(file: File) {
+        scope.launch {
+            val image = io {
+                runCatching {
+                    val decoded = decodeWallpaper(file) ?: return@runCatching null
+                    if (file.canonicalFile != wallpaperFile.canonicalFile) {
+                        file.copyTo(wallpaperFile, overwrite = true)
+                    }
+                    decoded
+                }.getOrNull()
+            }
+            if (image == null) {
+                wallpaperNote = "Couldn't read that picture. JPEG, PNG, WebP and BMP work."
+                return@launch
+            }
+            wallpaper = image
+            wallpaperNote = null
+            settings.hasWallpaper = true
+        }
+    }
+
+    fun clearWallpaper() {
+        wallpaper = null
+        wallpaperNote = null
+        settings.hasWallpaper = false
+        runCatching { wallpaperFile.delete() }
+    }
+
+    private fun loadWallpaper() {
+        if (!settings.hasWallpaper) return
+        scope.launch {
+            wallpaper = io { runCatching { decodeWallpaper(wallpaperFile) }.getOrNull() }
+        }
+    }
+
+    /** Longest edge 2560: sharp on a 1440p window, a fraction of a 4K photo's memory. */
+    private fun decodeWallpaper(file: File): ImageBitmap? =
+        Thumbnails.decodeScaled(file.readBytes(), maxEdge = 2560)
+
+    // ---- Proxy --------------------------------------------------------------
+
+    private val proxyState = mutableStateOf(
+        ProxyConfig(ProxyMode.fromName(settings.proxyMode), settings.proxyHost, settings.proxyPort)
+    )
+
+    init {
+        // Before anything goes online: every request the app makes, and every
+        // yt-dlp it starts, reads the route from here.
+        NetworkProxy.apply(proxyState.value)
+    }
+
+    /** Applied the moment it changes, so the next connection already takes the new route. */
+    var proxy: ProxyConfig
+        get() = proxyState.value
+        set(value) {
+            proxyState.value = value
+            settings.proxyMode = value.mode.name
+            settings.proxyHost = value.host
+            settings.proxyPort = value.port
+            NetworkProxy.apply(value)
+            proxyTestNote = null
+        }
+
+    var proxyTestNote by mutableStateOf<String?>(null)
+        private set
+
+    fun testProxy() {
+        val tested = proxy
+        proxyTestNote = "Testing…"
+        scope.launch {
+            val result = NetworkProxy.test()
+            // A result for a setting changed since would describe the wrong route.
+            if (proxy == tested) proxyTestNote = result
+        }
+    }
+
+    // ---- Music folder -------------------------------------------------------
+
+    /** Opens the folder downloads and dropped songs are saved to. */
+    fun openMusicFolder() {
+        val dir = File(settings.downloadDir)
+        runCatching {
+            dir.mkdirs()
+            java.awt.Desktop.getDesktop().open(dir)
+        }
+    }
+
+    // ---- Drag and drop ------------------------------------------------------
+
+    /** True while something is being dragged over the window. */
+    var dropHover by mutableStateOf(false)
+
+    var dropNote by mutableStateOf<String?>(null)
+        private set
+
+    fun dismissDropNote() { dropNote = null }
+
+    /**
+     * Files and folders dropped on the window.
+     *
+     * Folders join the library where they are, the same as adding one by hand.
+     * Loose songs are copied into the music folder, where downloads go, so they
+     * stay in the library if the originals are moved or deleted. Songs already
+     * inside the library are added as they are rather than copied again.
+     */
+    fun importDropped(files: List<File>) {
+        val droppedFolders = files.filter { it.isDirectory }
+        val songs = files.filter { it.isFile && AudioTypes.isProbablyAudio(null, it.name) }
+        val ignored = files.size - droppedFolders.size - songs.size
+
+        scope.launch {
+            val music = File(settings.downloadDir)
+            // Compared as lowercase text: Windows paths ignore case, File.startsWith does not.
+            val roots = (folders + settings.downloadDir)
+                .map { File(it).absoluteFile.normalize().path.trimEnd('\\', '/').lowercase() + File.separator }
+            val placed = io {
+                songs.mapNotNull { song ->
+                    val source = song.absoluteFile.normalize()
+                    if (roots.any { source.path.lowercase().startsWith(it) }) {
+                        source
+                    } else {
+                        runCatching {
+                            music.mkdirs()
+                            source.copyTo(freeName(music, source.name))
+                        }.getOrNull()
+                    }
+                }
+            }
+
+            if (droppedFolders.isNotEmpty()) {
+                folders = (folders + droppedFolders.map { it.absolutePath }).distinct()
+                settings.folders = folders
+                // Covers the copied songs too: the music folder is always scanned.
+                rescan()
+            } else {
+                addToLibrary(placed)
+            }
+
+            dropNote = buildList {
+                if (placed.isNotEmpty()) add("added ${placed.size} song${if (placed.size == 1) "" else "s"}")
+                if (droppedFolders.isNotEmpty()) {
+                    add("added ${droppedFolders.size} folder${if (droppedFolders.size == 1) "" else "s"}")
+                }
+                if (songs.size > placed.size) add("${songs.size - placed.size} couldn't be copied")
+                if (ignored > 0) add("skipped $ignored that aren't audio")
+            }.joinToString(", ").replaceFirstChar { it.uppercase() }.ifBlank { "Nothing there to add." }
+        }
+    }
+
+    /** A link dropped on the window starts downloading it. */
+    fun importDroppedText(text: String): Boolean {
+        val link = text.trim().lineSequence().firstOrNull()?.trim().orEmpty()
+        if (!link.startsWith("http", ignoreCase = true)) return false
+        startDownload(link)
+        dropNote = if (tools.ready) {
+            "Downloading that link. It's in the Download list."
+        } else {
+            "Install yt-dlp first, on the Download page, then drop the link again."
+        }
+        return true
+    }
+
+    /** [name] in [dir], or "name (2)" and so on if that is taken. */
+    private fun freeName(dir: File, name: String): File {
+        val stem = name.substringBeforeLast('.')
+        val extension = name.substringAfterLast('.', "")
+        var candidate = File(dir, name)
+        var n = 2
+        while (candidate.exists()) {
+            candidate = File(dir, if (extension.isEmpty()) "$stem ($n)" else "$stem ($n).$extension")
+            n++
+        }
+        return candidate
+    }
+
     fun togglePanel(kind: SidePanelKind) {
+        // The lyrics button brings popped-out lyrics back into the panel.
+        if (kind == SidePanelKind.LYRICS && lyricsDetached) {
+            lyricsDetached = false
+            sidePanel = kind
+            return
+        }
         sidePanel = if (sidePanel == kind) null else kind
     }
 
@@ -585,6 +933,94 @@ class DesktopController(private val scope: CoroutineScope) {
     var identifyTarget by mutableStateOf<DesktopTrack?>(null)
     var identifyMode by mutableStateOf(IdentifyMode.NAME)
 
+    /** Artist and title asked for separately, so each can be scored on its own field. */
+    var identifyArtist by mutableStateOf("")
+    var identifyTitle by mutableStateOf("")
+
+    // ---- YouTube search -----------------------------------------------------
+    //
+    // A separate list from identifyResults, because a YouTube hit is a
+    // different kind of thing: a video with a channel, a view count and an
+    // upload date, not a catalogue's claim about what a song is. Merging them
+    // would mean deciding that an uploader is an artist, which is how wrong
+    // metadata ends up written into tags.
+    //
+    // Piped is asked first because it answers in well under a second and
+    // carries the upload date; the bundled yt-dlp answers in about three and
+    // always works. Whichever replies first wins - see YouTubeSearch.
+
+    private val youtubeBackend = DesktopYouTubeBackend()
+
+    private val youtube = YouTubeSearch(
+        listOf(PipedYouTubeBackend(), youtubeBackend)
+    )
+
+    /**
+     * Resolves song names to links for the downloader. yt-dlp is never handed a
+     * search: see YouTubeLinkFinder for what "first result" turned out to mean.
+     */
+    private val linkFinder = YouTubeLinkFinder(youtube)
+
+    /** A `ytsearch1:` prefix left over from before, accepted and ignored. */
+    private val searchPrefix = Regex("""^ytsearch\d*:""", RegexOption.IGNORE_CASE)
+
+    val preview = PreviewPlayer { ToolPaths.ffmpeg }
+
+    var youtubeResults by mutableStateOf<List<YouTubeVideo>>(emptyList())
+        private set
+    var youtubeBusy by mutableStateOf(false)
+        private set
+    var youtubeStatus by mutableStateOf<String?>(null)
+        private set
+
+    fun searchYouTube(text: String = youtubeQuery) {
+        val query = text.trim()
+        if (query.isBlank() || youtubeBusy) return
+
+        youtubeBusy = true
+        youtubeStatus = "Searching YouTube…"
+        scope.launch {
+            val result = youtube.search(query, limit = 25)
+            youtubeResults = result.videos
+            youtubeStatus = when {
+                result.videos.isEmpty() ->
+                    "Nothing came back. yt-dlp may need updating — one click in " +
+                        "the Download tab."
+                result.skipped.isEmpty() ->
+                    "${result.videos.size} results via ${result.via}"
+                else ->
+                    // Named rather than hidden: a slow search is worth
+                    // explaining, and a dead Piped is the usual reason.
+                    "${result.videos.size} results via ${result.via} — " +
+                        "${result.skipped.joinToString(", ")} did not answer"
+            }
+            youtubeBusy = false
+        }
+    }
+
+    var youtubeQuery by mutableStateOf("")
+
+    /** Plays a result without downloading it. Tapping the same row stops it. */
+    fun previewYouTube(video: YouTubeVideo) {
+        // The main player keeps its place; two things playing at once is never
+        // what a preview tap meant.
+        if (engine.status.value.playing) engine.togglePlay()
+        preview.toggle(video.id) { id -> youtubeBackend.audioStreamUrl(id, downloadQuality) }
+    }
+
+    fun stopPreview() = preview.stop()
+
+    /** Hands the video to the existing downloader, as an mp3 at the set quality. */
+    fun downloadYouTube(video: YouTubeVideo) {
+        startDownload(video.watchUrl)
+    }
+
+    fun clearYouTube() {
+        youtubeResults = emptyList()
+        youtubeStatus = null
+        preview.stop()
+    }
+
     /** Set when the last attempt failed only because ffmpeg is missing. */
     var identifyNeedsFfmpeg by mutableStateOf(false)
         private set
@@ -654,7 +1090,17 @@ class DesktopController(private val scope: CoroutineScope) {
                 val resolved = io { LinkResolver.resolve(target) }
                 val fetchTarget = when (resolved) {
                     is ResolvedLink.Direct -> resolved.url
-                    is ResolvedLink.Search -> LinkResolver.searchTarget(resolved.query)
+                    is ResolvedLink.Search -> {
+                        identifyStatus = "Finding that track on YouTube..."
+                        when (val found = linkFinder.find(YouTubeLinkFinder.Wanted(title = resolved.query))) {
+                            is YouTubeLinkFinder.Outcome.Found -> found.pick.video.watchUrl
+                            is YouTubeLinkFinder.Outcome.NothingSuitable -> {
+                                identifyStatus = found.message
+                                identifyBusy = false
+                                return@launch
+                            }
+                        }
+                    }
                     is ResolvedLink.Unsupported -> {
                         identifyStatus = resolved.reason
                         identifyBusy = false
@@ -731,6 +1177,46 @@ class DesktopController(private val scope: CoroutineScope) {
         }
     }
 
+    /**
+     * Searches on the split artist/title fields.
+     *
+     * Splitting them is not cosmetic: knowing which half is the performer lets
+     * the ranker check each against the field it belongs to, which drops the
+     * covers and karaoke versions a single box scores almost as highly as the
+     * real recording.
+     */
+    fun searchByFields() {
+        val artist = identifyArtist.trim()
+        val title = identifyTitle.trim()
+        if (artist.isBlank() && title.isBlank()) return
+
+        identifyBusy = true
+        identifyNeedsFfmpeg = false
+        identifyStatus = "Searching seven catalogues..."
+        scope.launch {
+            // Providers take a single string, so the halves are joined for the
+            // lookup and separated again only for scoring.
+            val combined = listOf(artist, title).filter { it.isNotBlank() }.joinToString(" ")
+            val found = catalogue.searchAll(combined, limitPer = 8)
+            val results = MatchRanker.rankSplit(artist, title, found)
+            identifyResults = results
+            identifyQuery = combined
+
+            val dropped = found.size - results.size
+            val services = results.map { it.provider }.distinct().size
+            identifyStatus = when {
+                results.isEmpty() ->
+                    "Nothing came back. Try fewer words, or just the artist."
+                dropped > 0 ->
+                    "${results.size} matches from $services services " +
+                        "($dropped unrelated hidden)"
+                else ->
+                    "${results.size} matches from $services services"
+            }
+            identifyBusy = false
+        }
+    }
+
     fun searchCatalogues(text: String = identifyQuery) {
         if (text.isBlank()) return
         identifyBusy = true
@@ -801,11 +1287,65 @@ class DesktopController(private val scope: CoroutineScope) {
             settings.writeTagsOnIdentify = value
         }
 
+    // ---- Editing a track by hand --------------------------------------------
+
+    /** The track whose details are open for editing, if any. */
+    var editTarget by mutableStateOf<DesktopTrack?>(null)
+    var editNote by mutableStateOf<String?>(null)
+        private set
+
+    /**
+     * Writes edited details into the file's tags.
+     *
+     * Manual editing exists because automatic identification is right most of
+     * the time and not all of it — a live bootleg, a track nobody has catalogued,
+     * a name in a script the services transliterate differently. Fields left
+     * blank are cleared rather than ignored, because "remove the wrong album
+     * name" has to be expressible.
+     */
+    fun saveTrackDetails(
+        track: DesktopTrack,
+        title: String,
+        artist: String,
+        album: String,
+        year: String
+    ) {
+        scope.launch {
+            val result = io {
+                TagWriter.write(
+                    file = track.file,
+                    title = title.trim().ifBlank { track.file.nameWithoutExtension },
+                    artist = artist.trim(),
+                    album = album.trim(),
+                    year = year.trim().toIntOrNull(),
+                    clearBlanks = true
+                )
+            }
+            editNote = result.fold(
+                onSuccess = { "Saved." },
+                onFailure = { "Couldn't write those tags: ${it.message}" }
+            )
+            if (result.isSuccess) {
+                editTarget = null
+                rescan()
+            }
+        }
+    }
+
+    fun dismissEdit() {
+        editTarget = null
+        editNote = null
+    }
+
     // ---- Bulk tools ---------------------------------------------------------
 
     var bulk by mutableStateOf(BulkJob())
         private set
     private var bulkJob: Job? = null
+
+    private enum class BulkOutcome { UPDATED, ALREADY_HAD, NOTHING_FOUND }
+
+    private fun Boolean.asOutcome() = if (this) BulkOutcome.UPDATED else BulkOutcome.NOTHING_FOUND
 
     fun cancelBulk() {
         bulkJob?.cancel()
@@ -833,21 +1373,55 @@ class DesktopController(private val scope: CoroutineScope) {
                 skipped = skipped
             )
 
+            var done = 0
             var updated = 0
+            var alreadyHad = 0
             var failed = 0
-            for ((index, track) in queue.withIndex()) {
-                bulk = bulk.copy(done = index, current = track.title)
-                val ok = runCatching {
-                    when (kind) {
-                        BulkKind.COVERS -> bulkCover(track)
-                        BulkKind.TAGS -> bulkTags(track)
-                        BulkKind.LYRICS -> bulkLyrics(track)
-                        BulkKind.IDENTIFY -> bulkIdentify(track)
+            val inFlight = mutableListOf<String>()
+            val work = Channel<DesktopTrack>(Channel.UNLIMITED)
+            queue.forEach { work.trySend(it) }
+            work.close()
+
+            // Lookups mostly wait on the network, so several songs go at once;
+            // identifying decodes audio, so it stays one at a time. Workers share
+            // the UI thread between suspensions, so the counters need no locking.
+            val workers = if (kind == BulkKind.IDENTIFY) 1 else SONGS_AT_ONCE
+            coroutineScope {
+                repeat(workers) {
+                    launch {
+                        for (track in work) {
+                            inFlight += track.title
+                            bulk = bulk.copy(current = inFlight.joinToString("  ·  "))
+                            val outcome = try {
+                                when (kind) {
+                                    BulkKind.COVERS -> bulkCover(track)
+                                    BulkKind.TAGS -> bulkTags(track).asOutcome()
+                                    BulkKind.LYRICS -> bulkLyrics(track).asOutcome()
+                                    BulkKind.IDENTIFY -> bulkIdentify(track).asOutcome()
+                                }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (failure: Exception) {
+                                BulkOutcome.NOTHING_FOUND
+                            }
+                            when (outcome) {
+                                BulkOutcome.UPDATED -> updated++
+                                BulkOutcome.ALREADY_HAD -> alreadyHad++
+                                BulkOutcome.NOTHING_FOUND -> failed++
+                            }
+                            io { store.mark(track.file.absolutePath, column) }
+                            done++
+                            inFlight -= track.title
+                            bulk = bulk.copy(
+                                done = done,
+                                updated = updated,
+                                alreadyHad = alreadyHad,
+                                failed = failed,
+                                current = inFlight.joinToString("  ·  ")
+                            )
+                        }
                     }
-                }.getOrDefault(false)
-                if (ok) updated++ else failed++
-                io { store.mark(track.file.absolutePath, column) }
-                bulk = bulk.copy(updated = updated, failed = failed)
+                }
             }
 
             bulk = bulk.copy(
@@ -856,27 +1430,32 @@ class DesktopController(private val scope: CoroutineScope) {
                 current = "",
                 finishedNote = buildString {
                     append("$updated updated")
+                    if (alreadyHad > 0) append(", $alreadyHad already had art")
                     if (failed > 0) append(", $failed with nothing found")
                     if (skipped > 0) append(", $skipped skipped as already done")
                     append(".")
                 }
             )
             bulkJob = null
-            rescan()
+            // Fetched covers are already in place and on screen, so only the tools
+            // that rewrite tags need the library read again.
+            if (kind != BulkKind.COVERS) rescan()
         }
     }
 
-    private suspend fun bulkCover(track: DesktopTrack): Boolean {
-        if (io { Covers.hasLocalArt(track) }) return false
-        val url = catalogue.searchForArtwork(track.searchQuery) ?: return false
-        return Covers.fetchAndStore(track, url, writeTags)
+    private suspend fun bulkCover(track: DesktopTrack): BulkOutcome {
+        if (io { Covers.hasLocalArt(track) }) return BulkOutcome.ALREADY_HAD
+        val stored = libraryLookup.findArtwork(track.searchQuery) { url ->
+            Covers.fetchAndStore(track, url, writeTags).takeIf { it }
+        }
+        return if (stored != null) BulkOutcome.UPDATED else BulkOutcome.NOTHING_FOUND
     }
 
     private suspend fun bulkTags(track: DesktopTrack): Boolean {
-        val (matches, _) = catalogue.search(track.searchQuery, limit = 1)
-        val match = matches.firstOrNull() ?: return false
+        val details = libraryLookup.findDetails(track.artist, track.title, giveUpMs = TAGS_GIVE_UP_MS)
+            ?: return false
         return io {
-            TagWriter.write(track.file, match.title, match.artist, match.album, match.releaseYear)
+            TagWriter.write(track.file, details.title, details.artist, details.album, details.year)
                 .isSuccess
         }
     }
@@ -1188,6 +1767,22 @@ class DesktopController(private val scope: CoroutineScope) {
             qualityState.value = value
             settings.downloadQualityName = value.name
         }
+    /** Finished downloads the Download page has already shown. */
+    private var acknowledgedDownloads by mutableStateOf<Set<Long>>(emptySet())
+
+    /** Downloads that finished since the Download page was last looked at. */
+    val unseenFinishedDownloads: Int
+        get() = downloads.count { it.done && !it.failed && it.id !in acknowledgedDownloads }
+
+    fun acknowledgeDownloads() {
+        val finished = downloads.filter { it.done }.map { it.id }.toSet()
+        // Written only on change: this runs from an effect keyed on the list, and
+        // an unconditional write would keep re-triggering it.
+        if (!acknowledgedDownloads.containsAll(finished)) {
+            acknowledgedDownloads = acknowledgedDownloads + finished
+        }
+    }
+
     var downloads by mutableStateOf<List<DownloadEntry>>(emptyList())
         private set
     var downloadLog by mutableStateOf<List<String>>(emptyList())
@@ -1235,8 +1830,14 @@ class DesktopController(private val scope: CoroutineScope) {
                 return@launch
             }
 
-            val resolved = io { LinkResolver.resolve(url) }
-            val target = when (resolved) {
+            // A song name rather than a link: found on YouTube first, and the
+            // link that was found is what yt-dlp is given.
+            val target = if (!url.startsWith("http", ignoreCase = true)) {
+                val text = url.replace(searchPrefix, "").trim()
+                update(entry.id) { it.status = "Finding it on YouTube…" }
+                findYouTubeLink(entry.id, YouTubeLinkFinder.Wanted(title = text))
+                    ?: return@launch
+            } else when (val resolved = io { LinkResolver.resolve(url) }) {
                 is ResolvedLink.Direct -> {
                     update(entry.id) { it.display = "${resolved.service} · $url" }
                     resolved.url
@@ -1246,7 +1847,8 @@ class DesktopController(private val scope: CoroutineScope) {
                         it.display = resolved.display
                         it.note = resolved.note
                     }
-                    LinkResolver.searchTarget(resolved.query)
+                    findYouTubeLink(entry.id, YouTubeLinkFinder.Wanted(title = resolved.query))
+                        ?: return@launch
                 }
                 is ResolvedLink.Unsupported -> {
                     update(entry.id) {
@@ -1282,9 +1884,8 @@ class DesktopController(private val scope: CoroutineScope) {
                             "Saved ${files.size} file${if (files.size == 1) "" else "s"}"
                         }
                     }
-                    // If the download folder is in the library, the new files
-                    // should appear without the user having to press rescan.
-                    if (folders.any { destination.absolutePath.startsWith(it) }) rescan()
+                    // Straight into the library, wherever the download folder is.
+                    addToLibrary(files)
                 },
                 onFailure = { error ->
                     update(entry.id) {
@@ -1305,6 +1906,42 @@ class DesktopController(private val scope: CoroutineScope) {
      * do not, so the artist and title are handed to yt-dlp as a search instead,
      * which is the same fallback a Spotify link takes.
      */
+    /**
+     * Finds the YouTube video that is the song and returns its link.
+     *
+     * When nothing suitable turns up the entry fails with the reason, rather
+     * than saving an edit or a cover that would look like success.
+     */
+    private suspend fun findYouTubeLink(id: Long, wanted: YouTubeLinkFinder.Wanted): String? =
+        when (val outcome = linkFinder.find(wanted)) {
+            is YouTubeLinkFinder.Outcome.Found -> {
+                val video = outcome.pick.video
+                update(id) { entry ->
+                    entry.display = "YouTube · ${video.title}"
+                    entry.note = listOfNotNull(
+                        entry.note,
+                        buildString {
+                            append("Found: ${video.channel}")
+                            video.durationSeconds?.let { append(" · ${YouTubeFormat.duration(it)}") }
+                            video.viewCount?.let { append(" · ${YouTubeFormat.views(it)}") }
+                            append(" · ${video.watchUrl}")
+                        }
+                    ).joinToString("\n")
+                    entry.status = "Starting…"
+                }
+                video.watchUrl
+            }
+
+            is YouTubeLinkFinder.Outcome.NothingSuitable -> {
+                update(id) { entry ->
+                    entry.done = true
+                    entry.failed = true
+                    entry.status = outcome.message
+                }
+                null
+            }
+        }
+
     fun downloadMatch(match: MusicMatch) {
         if (match.drmProtected) {
             toolNote = "${match.provider} streams DRM-protected audio - there is no file " +
@@ -1325,14 +1962,24 @@ class DesktopController(private val scope: CoroutineScope) {
             id = System.nanoTime(),
             target = match.display,
             display = match.display,
-            note = "${match.provider} has no downloadable file, so this searches " +
-                "YouTube for the same track."
+            note = "${match.provider} has no downloadable file, so the same track is " +
+                "found on YouTube first and that link is downloaded."
         )
         downloads = downloads + entry
         scope.launch {
-            update(entry.id) { it.status = "Searching…" }
+            update(entry.id) { it.status = "Finding it on YouTube…" }
+            // The match's own title, artist and length, so the finder can refuse
+            // an edit that happens to share the name.
+            val link = findYouTubeLink(
+                entry.id,
+                YouTubeLinkFinder.Wanted(
+                    title = match.title,
+                    artist = match.artist,
+                    durationMs = match.durationMs
+                )
+            ) ?: return@launch
             val result = YtDlp.download(
-                target = LinkResolver.searchTarget(match.display),
+                target = link,
                 destination = File(settings.downloadDir),
                 toMp3 = downloadToMp3 && tools.ffmpeg,
                 embedThumbnail = downloadEmbedArt,
@@ -1348,7 +1995,7 @@ class DesktopController(private val scope: CoroutineScope) {
                         it.files = files
                         it.status = "Saved ${files.size} file${if (files.size == 1) "" else "s"}"
                     }
-                    rescan()
+                    addToLibrary(files)
                 },
                 onFailure = { error ->
                     update(entry.id) {
@@ -1440,6 +2087,292 @@ class DesktopController(private val scope: CoroutineScope) {
 
     val downloadDir: String get() = settings.downloadDir
 
+    // ---- Selecting several tracks -------------------------------------------
+    //
+    // Windows conventions, because this is a Windows app: Ctrl+click toggles
+    // one, Shift+click takes a range from the last thing touched, Ctrl+A takes
+    // everything on screen, Escape drops it. A plain click still plays, which
+    // is the one place this differs from a file manager - it is a music player
+    // first, and losing click-to-play to gain click-to-select would be a poor
+    // trade.
+    //
+    // Held as absolute paths rather than indices: the table is re-sorted and
+    // re-filtered constantly, and an index would silently come to mean a
+    // different track.
+
+    var selectedPaths by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    /** Where a Shift+click range measures from. */
+    private var selectionAnchor: String? = null
+
+    val hasSelection: Boolean get() = selectedPaths.isNotEmpty()
+
+    fun clearSelection() {
+        selectedPaths = emptySet()
+        selectionAnchor = null
+    }
+
+    /** Ctrl+click: add or remove one, and move the anchor here. */
+    fun toggleSelection(track: DesktopTrack) {
+        val path = track.file.absolutePath
+        selectedPaths = if (path in selectedPaths) selectedPaths - path else selectedPaths + path
+        selectionAnchor = path
+    }
+
+    /**
+     * Shift+click: everything between the anchor and here.
+     *
+     * With no anchor yet this behaves as a plain Ctrl+click, which is what
+     * every file manager does on a first Shift+click.
+     */
+    fun extendSelection(track: DesktopTrack, visible: List<DesktopTrack>) {
+        val anchorPath = selectionAnchor
+        if (anchorPath == null) {
+            toggleSelection(track)
+            return
+        }
+        val from = visible.indexOfFirst { it.file.absolutePath == anchorPath }
+        val to = visible.indexOfFirst { it.file.absolutePath == track.file.absolutePath }
+        if (from < 0 || to < 0) {
+            toggleSelection(track)
+            return
+        }
+        val range = if (from <= to) from..to else to..from
+        // Added to what is already selected rather than replacing it, so
+        // Ctrl+click then Shift+click builds up as expected.
+        selectedPaths = selectedPaths + range.map { visible[it].file.absolutePath }
+    }
+
+    fun selectAll(visible: List<DesktopTrack>) {
+        selectedPaths = visible.map { it.file.absolutePath }.toSet()
+        selectionAnchor = visible.lastOrNull()?.file?.absolutePath
+    }
+
+    fun selectedTracks(visible: List<DesktopTrack>): List<DesktopTrack> =
+        visible.filter { it.file.absolutePath in selectedPaths }
+
+    /** Plays the selection, in the order it appears on screen. */
+    fun playSelection(visible: List<DesktopTrack>) {
+        val chosen = selectedTracks(visible)
+        chosen.firstOrNull()?.let { play(it, chosen) }
+    }
+
+    fun favouriteSelection(visible: List<DesktopTrack>) {
+        val chosen = selectedTracks(visible)
+        if (chosen.isEmpty()) return
+        // One decision for the whole selection: if any are not favourites,
+        // favourite all of them. Toggling each would leave a mixed set mixed.
+        val makeFavourite = chosen.any { it.file.absolutePath !in favourites }
+        scope.launch {
+            io {
+                for (track in chosen) {
+                    store.setFavourite(track.file.absolutePath, makeFavourite)
+                }
+            }
+            favourites = io { store.favourites() }
+        }
+    }
+
+    fun zipSelection(visible: List<DesktopTrack>) {
+        val chosen = selectedTracks(visible)
+        clearSelection()
+        startArchive("Selection", chosen)
+    }
+
+    /** Opens the containing folder, selecting the first of them. */
+    fun revealSelection(visible: List<DesktopTrack>) {
+        val first = selectedTracks(visible).firstOrNull() ?: return
+        Explorer.reveal(first.file)
+    }
+
+    /**
+     * Sends the selected files to the Recycle Bin.
+     *
+     * Not [java.io.File.delete]: these are the user's own files in their own
+     * folders, and a mis-click has to be recoverable.
+     */
+    fun deleteSelection(visible: List<DesktopTrack>) {
+        val chosen = selectedTracks(visible)
+        if (chosen.isEmpty()) return
+        clearSelection()
+        deleteTracks(chosen)
+    }
+
+    /**
+     * Moves tracks to the Recycle Bin and takes them out of the library.
+     *
+     * Not [java.io.File.delete]: these are the user's own files in their own
+     * folders, and a mis-click has to be recoverable. If the song that is playing
+     * is among them, playback stops first, because Windows will not move a file
+     * that is still open and the delete would otherwise fail without a word.
+     */
+    fun deleteTracks(chosen: List<DesktopTrack>) {
+        if (chosen.isEmpty()) return
+        val paths = chosen.map { it.file.absolutePath }.toSet()
+        if (engine.status.value.track?.file?.absolutePath in paths) engine.stop()
+
+        scope.launch {
+            val failed = io {
+                chosen.filterNot { track ->
+                    runCatching {
+                        val desktop = java.awt.Desktop.getDesktop()
+                        if (desktop.isSupported(java.awt.Desktop.Action.MOVE_TO_TRASH)) {
+                            desktop.moveToTrash(track.file)
+                        } else {
+                            track.file.delete()
+                        }
+                    }.getOrDefault(false)
+                }
+            }
+            val removed = chosen.filterNot { it in failed }
+            if (removed.isNotEmpty()) {
+                val gone = removed.map { it.file.absolutePath }
+                io { store.forgetPaths(gone) }
+                // Taken out of the list directly: a rescan would re-read every tag
+                // in the library to remove one file.
+                val goneSet = gone.toSet()
+                tracks = tracks.filterNot { it.file.absolutePath in goneSet }
+                favourites = favourites - goneSet
+            }
+            archiveNote = null
+            selectionNote = buildString {
+                if (removed.isNotEmpty()) {
+                    append("Moved ${removed.size} file${if (removed.size == 1) "" else "s"} to the Recycle Bin.")
+                }
+                if (failed.isNotEmpty()) {
+                    if (isNotEmpty()) append(" ")
+                    append(
+                        "Couldn't move ${failed.first().file.name}" +
+                            (if (failed.size > 1) " and ${failed.size - 1} more" else "") +
+                            ". It may be open in another program."
+                    )
+                }
+            }
+        }
+    }
+
+    var selectionNote by mutableStateOf<String?>(null)
+        private set
+
+    fun dismissSelectionNote() { selectionNote = null }
+
+    // ---- Zip and ship -------------------------------------------------------
+
+    /** Progress and outcome of the current archive job. */
+    var archiveRunning by mutableStateOf(false)
+        private set
+    var archiveProgress by mutableStateOf(0f)
+        private set
+    var archiveCurrent by mutableStateOf("")
+        private set
+    var archiveNote by mutableStateOf<String?>(null)
+        private set
+    var archiveFile by mutableStateOf<File?>(null)
+        private set
+
+    private var archiveJob: Job? = null
+    @Volatile private var archiveCancelled = false
+
+    /** Zips the whole library. */
+    fun zipLibrary() = startArchive("Library", tracks)
+
+    /** Zips one playlist, in its own order. */
+    fun zipPlaylist(playlist: StoredPlaylist) {
+        scope.launch {
+            val paths = io { store.playlistPaths(playlist.id) }
+            val byPath = tracks.associateBy { it.file.absolutePath }
+            startArchive(playlist.name, paths.mapNotNull { byPath[it] })
+        }
+    }
+
+    /**
+     * Packs [chosen] into a zip beside the downloads folder.
+     *
+     * Entry names carry the artist so an archive is navigable once unpacked —
+     * a folder of two hundred files called "01.mp3" is not. Numbering keeps a
+     * playlist's order, which the filesystem would otherwise sort away.
+     */
+    internal fun startArchive(label: String, chosen: List<DesktopTrack>) {
+        if (archiveRunning) return
+        if (chosen.isEmpty()) {
+            archiveNote = "Nothing to archive."
+            return
+        }
+
+        archiveCancelled = false
+        archiveRunning = true
+        archiveProgress = 0f
+        archiveNote = null
+        archiveFile = null
+
+        archiveJob = scope.launch {
+            val stamp = java.time.LocalDate.now().toString()
+            val destination = File(
+                File(settings.downloadDir, "archives"),
+                MusicArchive.safeName("Resonate $label $stamp") + ".zip"
+            )
+            val digits = chosen.size.toString().length
+            val entries = chosen.mapIndexed { index, track ->
+                val number = (index + 1).toString().padStart(digits, '0')
+                val artist = track.artist?.takeIf { it.isNotBlank() }
+                val stem = listOfNotNull(artist, track.title).joinToString(" - ")
+                ArchiveEntry(
+                    source = track.file,
+                    entryName = "$number ${MusicArchive.safeName(stem)}.${track.file.extension}"
+                )
+            }
+
+            val result = io {
+                MusicArchive.zip(
+                    entries = entries,
+                    destination = destination,
+                    onProgress = { progress ->
+                        archiveProgress = progress.fraction
+                        archiveCurrent = progress.currentName
+                    },
+                    shouldContinue = { !archiveCancelled }
+                )
+            }
+
+            archiveRunning = false
+            archiveCurrent = ""
+            result.fold(
+                onSuccess = { done ->
+                    archiveFile = done.file
+                    archiveNote = buildString {
+                        append("${done.included} tracks, ")
+                        append("%.1f MB".format(done.bytes / 1_048_576.0))
+                        if (done.skipped.isNotEmpty()) {
+                            append(" — ${done.skipped.size} missing from storage")
+                        }
+                    }
+                },
+                onFailure = { archiveNote = it.message ?: "Couldn't build the archive." }
+            )
+            archiveJob = null
+        }
+    }
+
+    fun cancelArchive() {
+        archiveCancelled = true
+        archiveJob?.cancel()
+        archiveJob = null
+        archiveRunning = false
+        archiveNote = "Cancelled."
+    }
+
+    /** Opens the folder the archive landed in, and selects it. */
+    fun revealArchive() {
+        val file = archiveFile ?: return
+        Explorer.reveal(file)
+    }
+
+    fun dismissArchive() {
+        archiveNote = null
+        archiveFile = null
+    }
+
     // ---- Duplicates ---------------------------------------------------------
 
     var duplicates by mutableStateOf<List<DesktopDuplicateGroup>>(emptyList())
@@ -1449,7 +2382,7 @@ class DesktopController(private val scope: CoroutineScope) {
     var duplicatesNote by mutableStateOf<String?>(null)
         private set
 
-    fun findDuplicates() {
+    fun findDuplicates(within: List<DesktopTrack>? = null) {
         duplicatesScanning = true
         duplicatesNote = null
         scope.launch {
@@ -1459,7 +2392,7 @@ class DesktopController(private val scope: CoroutineScope) {
                 // called it directly would re-read the same track O(log n) times.
                 val hasArt = HashMap<String, Boolean>()
                 DuplicateMatcher.group(
-                    items = tracks,
+                    items = within ?: tracks,
                     artistOf = { it.artist },
                     titleOf = { it.title },
                     durationOf = { it.durationMs },
@@ -1510,16 +2443,130 @@ class DesktopController(private val scope: CoroutineScope) {
         }
     }
 
+    // ---- Albums and artists -------------------------------------------------
+
+    var albumSort by mutableStateOf(GroupSort.NAME)
+    var artistSort by mutableStateOf(GroupSort.NAME)
+
+    /** Keys of the album or artist cards picked with Ctrl or Shift. */
+    var pickedGroups by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    /** Which page [pickedGroups] belongs to. */
+    var pickedKind by mutableStateOf<CollectionKind?>(null)
+        private set
+
+    /** Where a Shift+click on a card measures from. */
+    private var pickAnchor: String? = null
+
+    fun clearPicked() {
+        pickedGroups = emptySet()
+        pickedKind = null
+        pickAnchor = null
+    }
+
+    /** Ctrl+click on a card: pick it, or unpick it. */
+    fun togglePicked(kind: CollectionKind, group: TrackGroup) {
+        if (pickedKind != kind) clearPicked()
+        pickedKind = kind
+        pickedGroups = if (group.key in pickedGroups) pickedGroups - group.key else pickedGroups + group.key
+        pickAnchor = group.key
+    }
+
+    /** Shift+click on a card: everything from the last Ctrl+click to here. */
+    fun extendPicked(kind: CollectionKind, group: TrackGroup, shown: List<TrackGroup>) {
+        val from = shown.indexOfFirst { it.key == pickAnchor }
+        val to = shown.indexOfFirst { it.key == group.key }
+        if (pickedKind != kind || from < 0 || to < 0) {
+            togglePicked(kind, group)
+            return
+        }
+        pickedGroups = pickedGroups + (minOf(from, to)..maxOf(from, to)).map { shown[it].key }
+    }
+
+    /** What the merge dialog offers: one plan for the picked cards, or one for each duplicate set. */
+    var mergePlans by mutableStateOf<List<MergePlan>>(emptyList())
+        private set
+    var mergeKind by mutableStateOf(CollectionKind.ALBUMS)
+        private set
+    var mergeFromPicked by mutableStateOf(false)
+        private set
+    var merging by mutableStateOf(false)
+        private set
+
+    /** How the last merge went, shown under the page title. */
+    var mergeNote by mutableStateOf<String?>(null)
+        private set
+
+    fun planPickedMerge(kind: CollectionKind, shown: List<TrackGroup>) {
+        val chosen = shown.filter { it.key in pickedGroups }
+        if (pickedKind != kind || chosen.size < 2) return
+        mergeKind = kind
+        mergeFromPicked = true
+        mergeNote = null
+        mergePlans = listOf(TrackGroups.plan(kind, chosen))
+    }
+
+    fun planDuplicateMerges(kind: CollectionKind, shown: List<TrackGroup>) {
+        mergeKind = kind
+        mergeFromPicked = false
+        mergeNote = null
+        mergePlans = TrackGroups.duplicates(kind, shown).map { TrackGroups.plan(kind, it) }
+    }
+
+    /**
+     * Retags the songs in [plans] so that each set becomes one album or artist,
+     * then re-reads only those files.
+     *
+     * Written into the files themselves: a merge kept only in Resonate would
+     * come apart at the next scan, and would show in no other player.
+     */
+    fun merge(plans: List<MergePlan>) {
+        if (plans.isEmpty() || merging) return
+        merging = true
+        mergeNote = null
+        scope.launch {
+            val changes = plans.flatMap { TrackGroups.changes(it) }
+            // Whatever happens - an unreadable file, a locked one - the merge has
+            // to end: leaving it running would disable every merge button for good.
+            val outcome = runCatching {
+                val written = io { changes.filter { TagWriter.change(it).isSuccess }.map { it.file } }
+                val reread = FolderLibrary.readFiles(written).associateBy { it.file.absolutePath }
+                tracks = tracks.map { reread[it.file.absolutePath] ?: it }
+                written.size
+            }
+            clearPicked()
+            mergePlans = emptyList()
+            merging = false
+            val what = if (plans.size == 1) {
+                "${plans[0].groups.size} ${plans[0].kind.plural} into “${plans[0].name}”"
+            } else {
+                "${plans.size} sets of ${plans[0].kind.plural}"
+            }
+            mergeNote = outcome.fold(
+                { written ->
+                    val failed = changes.size - written
+                    "Merged $what · $written songs retagged" +
+                        if (failed > 0) " · $failed could not be written - playing, or open elsewhere?" else ""
+                },
+                { "Merging $what failed: ${it.message ?: it.javaClass.simpleName}" }
+            )
+        }
+    }
+
     // ---- Lifecycle ----------------------------------------------------------
 
     fun start() {
         applyOutputs()
         pushVolume()
         applyDuckBinding()
-        if (folders.isNotEmpty()) rescan() else scope.launch { refreshAggregates() }
+        // The music folder is always part of the library, so there is something to
+        // scan even before any folder has been added by hand.
+        rescan()
         refreshPlaylists()
         refreshTools()
         refreshWeather()
+        loadWallpaper()
     }
 
     fun release() {
@@ -1536,10 +2583,21 @@ class DesktopController(private val scope: CoroutineScope) {
 enum class IdentifyMode(val label: String, val placeholder: String) {
     NAME("Name", "Artist and title, or whatever you can remember"),
     LYRICS("Lyrics", "A line you remember, however roughly"),
-    LINK("Link", "TikTok, Instagram, YouTube, SoundCloud link")
+    LINK("Link", "TikTok, Instagram, YouTube, SoundCloud link"),
+    YOUTUBE("YouTube", "Search YouTube — anything, not just music")
 }
 
 /** The four bulk tools, and the mark each one records so reruns can skip. */
+/** How many songs the cover and tag tools look up at once. */
+private const val SONGS_AT_ONCE = 5
+
+/**
+ * How long one song's tag lookup may take. Every track goes through the tag
+ * tool, not only the ones missing something, so a slow service is cut off
+ * sooner than for covers.
+ */
+private const val TAGS_GIVE_UP_MS = 10_000L
+
 enum class BulkKind(val label: String, val markColumn: String) {
     COVERS("Covers", "artCheckedAt"),
     TAGS("Names & tags", "identifiedAt"),

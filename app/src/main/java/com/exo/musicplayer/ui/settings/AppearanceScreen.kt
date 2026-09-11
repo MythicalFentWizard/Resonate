@@ -1,10 +1,14 @@
 package com.exo.musicplayer.ui.settings
 
+import android.net.Uri
 import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,15 +22,19 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -36,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -43,6 +52,7 @@ import com.exo.musicplayer.ui.theme.AppPalette
 import com.exo.musicplayer.ui.theme.Starfield
 import com.exo.musicplayer.ui.theme.ThemeMode
 import com.exo.musicplayer.ui.theme.ThemeState
+import kotlin.math.roundToInt
 
 @Composable
 fun AppearanceScreen(
@@ -52,8 +62,16 @@ fun AppearanceScreen(
     onMode: (ThemeMode) -> Unit,
     onDynamic: (Boolean) -> Unit,
     onStars: (Boolean) -> Unit,
+    onWallpaper: (Uri) -> Unit,
+    onClearWallpaper: () -> Unit,
+    onWallpaperDim: (Float) -> Unit,
+    onLyricsActive: (Int?) -> Unit,
+    onLyricsInactive: (Int?) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let(onWallpaper)
+    }
     LazyColumn(modifier.fillMaxSize()) {
         item {
             Row(
@@ -78,7 +96,7 @@ fun AppearanceScreen(
             Row(
                 Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp),
+                    .padding(horizontal = 20.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 ThemeMode.entries.forEach { mode ->
@@ -97,7 +115,7 @@ fun AppearanceScreen(
             Row(
                 Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 5.dp),
+                    .padding(horizontal = 20.dp, vertical = 5.dp),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 pair.forEach { palette ->
@@ -142,7 +160,7 @@ fun AppearanceScreen(
                 color = MaterialTheme.colorScheme.surfaceVariant,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp)
+                    .padding(horizontal = 20.dp, vertical = 8.dp)
                     .height(120.dp)
             ) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -158,7 +176,108 @@ fun AppearanceScreen(
             }
         }
 
+        item { SectionLabel("Wallpaper") }
+        item {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+                Text(
+                    "A picture of your own behind the app. The starfield, when on, is drawn over it.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(12.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Button(onClick = { picker.launch("image/*") }) {
+                        Text(if (theme.wallpaper == 0L) "Choose picture" else "Change picture")
+                    }
+                    if (theme.wallpaper != 0L) {
+                        OutlinedButton(onClick = onClearWallpaper) { Text("Remove") }
+                    }
+                }
+                if (theme.wallpaper != 0L) {
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        "Dim ${(theme.wallpaperDim * 100).roundToInt()}%",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Slider(
+                        value = theme.wallpaperDim,
+                        onValueChange = onWallpaperDim,
+                        valueRange = 0f..0.9f
+                    )
+                }
+            }
+        }
+
+        item { SectionLabel("Lyrics") }
+        item {
+            ColourChoiceRow(
+                title = "Current line",
+                selected = theme.lyricsActive,
+                themeColour = MaterialTheme.colorScheme.primary,
+                onPick = onLyricsActive
+            )
+        }
+        item {
+            ColourChoiceRow(
+                title = "Other lines",
+                selected = theme.lyricsInactive,
+                themeColour = MaterialTheme.colorScheme.onSurfaceVariant,
+                onPick = onLyricsInactive
+            )
+        }
+
         item { Spacer(Modifier.height(28.dp)) }
+    }
+}
+
+private val LYRIC_COLOURS = listOf(
+    0xFFFFFFFF, 0xFFE6E1F0, 0xFF9A96A6, 0xFFFFD166, 0xFFFF8A80,
+    0xFFFF8FC7, 0xFFB99BFF, 0xFF7ACBFF, 0xFF7EE8B5
+).map { it.toInt() }
+
+/** The theme's own colour first, then a row of presets. */
+@Composable
+private fun ColourChoiceRow(title: String, selected: Int?, themeColour: Color, onPick: (Int?) -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) {
+        Text(title, style = MaterialTheme.typography.bodyLarge)
+        Spacer(Modifier.height(10.dp))
+        Row(
+            Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            ColourDot(themeColour, selected == null, "Theme") { onPick(null) }
+            LYRIC_COLOURS.forEach { argb -> ColourDot(Color(argb), selected == argb, null) { onPick(argb) } }
+        }
+    }
+}
+
+@Composable
+private fun ColourDot(colour: Color, selected: Boolean, label: String?, onClick: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            Modifier
+                .size(36.dp)
+                .clip(CircleShape)
+                .background(colour)
+                .border(
+                    2.dp,
+                    if (selected) MaterialTheme.colorScheme.onBackground else MaterialTheme.colorScheme.outlineVariant,
+                    CircleShape
+                )
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center
+        ) {
+            if (selected) {
+                Icon(
+                    Icons.Default.Check,
+                    contentDescription = "Selected",
+                    tint = if (colour.luminance() > 0.5f) Color.Black else Color.White,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(label ?: "", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 

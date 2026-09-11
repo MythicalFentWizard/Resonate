@@ -48,7 +48,15 @@ class PlaybackService : MediaSessionService() {
                 enableFloatOutput: Boolean,
                 enableAudioTrackPlaybackParams: Boolean
             ): AudioSink = DefaultAudioSink.Builder(context)
-                .setAudioProcessors(arrayOf(TeeAudioProcessor(tap)))
+                // Two taps in series. Both are pass-through, so the order
+                // only decides which sees the buffer first, and neither
+                // changes what the next one gets.
+                .setAudioProcessors(
+                    arrayOf(
+                        TeeAudioProcessor(tap),
+                        TeeAudioProcessor(SpectrumTap(Spectrum.analyser))
+                    )
+                )
                 .setEnableFloatOutput(enableFloatOutput)
                 .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
                 .build()

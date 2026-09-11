@@ -80,6 +80,88 @@ object MatchRanker {
         ).map { it.first }
     }
 
+    /**
+     * Ranks results when the artist and the title were given separately.
+     *
+     * Strictly better than the single-box form, because the ambiguity it has to
+     * guess at is simply gone: "queen" is known to be the performer, so a cover
+     * literally titled "Bohemian Rhapsody - Queen" by somebody else no longer
+     * scores at all, where the combined query cannot tell the two apart.
+     *
+     * Either field may be left empty — searching by artist alone to browse, or
+     * by title alone when the performer is the thing you have forgotten — and
+     * the scoring falls back to the combined form in that case.
+     */
+    fun rankSplit(
+        artistQuery: String,
+        titleQuery: String,
+        matches: List<MusicMatch>,
+        minScore: Double = MIN_SCORE
+    ): List<MusicMatch> {
+        if (artistQuery.isBlank() || titleQuery.isBlank()) {
+            return rank(listOf(artistQuery, titleQuery).filter { it.isNotBlank() }
+                .joinToString(" "), matches, minScore)
+        }
+        val scored = matches.map { it to scoreSplit(artistQuery, titleQuery, it) }
+        val kept = scored.filter { it.second >= minScore }
+        val pool = kept.ifEmpty { scored.sortedByDescending { it.second }.take(5) }
+        return pool.sortedWith(
+            compareByDescending<Pair<MusicMatch, Double>> { it.second }
+                .thenBy { tokens(it.first.title, stripBracketed = false).size }
+        ).map { it.first }
+    }
+
+    /**
+     * Scores a result against a named artist and a named title.
+     *
+     * Each half is checked against the field it belongs to, and both have to
+     * hold up: a right title by the wrong artist and a right artist with the
+     * wrong title are both wrong, so the two coverages are combined in a way
+     * that a single strong half cannot rescue. The title carries slightly more
+     * weight than the artist, because artists get abbreviated ("beatles") far
+     * more often than titles do.
+     */
+    fun scoreSplit(artistQuery: String, titleQuery: String, match: MusicMatch): Double {
+        val wantedArtist = tokens(artistQuery)
+        val wantedTitle = tokens(titleQuery)
+        if (wantedArtist.isEmpty() && wantedTitle.isEmpty()) return 0.0
+
+        val haveArtist = tokens(match.artist)
+        val haveTitle = tokens(match.title)
+
+        // The artist is also looked for in the album, because compilations and
+        // soundtracks routinely credit "Various Artists" on the track itself.
+        val artistFields = haveArtist + tokens(match.album)
+
+        val artistCoverage = coverageOf(wantedArtist, artistFields)
+        val titleCoverage = coverageOf(wantedTitle, haveTitle)
+
+        // Neither half may be waved through. Below this a field is not a near
+        // miss, it is a different song or a different performer.
+        if (artistCoverage < 0.34 || titleCoverage < 0.34) return 0.0
+
+        val phrase = phraseScore(wantedTitle, emptyList(), haveTitle)
+        return (0.42 * artistCoverage + 0.48 * titleCoverage + 0.10 * phrase)
+            .coerceIn(0.0, 1.0)
+    }
+
+    /** Mean best-match score of [wanted] against [fields]. */
+    private fun coverageOf(wanted: List<String>, fields: List<String>): Double {
+        if (wanted.isEmpty()) return 1.0
+        if (fields.isEmpty()) return 0.0
+        return wanted.sumOf { tokenScore(it, fields) } / wanted.size
+    }
+
+    /**
+     * Fuzzy coverage of one token list by another, from 0 to 1.
+     *
+     * The same per-word matching the ranker uses, forgiving typos and prefixes,
+     * exposed so the YouTube link finder scores titles with this implementation
+     * instead of growing a second one that would drift from it.
+     */
+    fun coverage(wanted: List<String>, fields: List<String>): Double =
+        coverageOf(wanted, fields)
+
     fun score(query: String, match: MusicMatch): Double =
         score(query, match.artist, match.title, match.album)
 

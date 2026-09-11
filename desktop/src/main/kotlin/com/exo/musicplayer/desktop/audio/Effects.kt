@@ -1,116 +1,172 @@
 package com.exo.musicplayer.desktop.audio
 
-import com.exo.musicplayer.data.recognition.Dsp
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.pow
+import kotlin.math.sign
+import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.math.tanh
+import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Time-stretching by WSOLA (waveform similarity overlap-add).
+ * Time-stretching for "slowed" and "sped up" without moving the pitch.
  *
- * Needed because "slowed" and "pitch" have to stay independent, exactly as on
- * Android. Plain resampling couples them — slow it down and it inevitably goes
- * deeper. WSOLA changes duration while leaving pitch alone by overlapping
- * windows at a shifted rate, choosing each window's offset by cross-correlation
- * so successive windows stay phase-aligned. Without that correlation search
- * (i.e. plain OLA) the result develops a distinctive metallic warble.
+ * Built the way SoundTouch's time-domain stretcher is. The song is cut into
+ * sequences of 45 to 100 ms, longer the slower it plays. Each is copied
+ * untouched apart from a 12 ms crossfade into the next, and where the next one
+ * starts is chosen within a 15 to 22 ms search by normalised cross-correlation
+ * against the end of the one before, so the join lands in phase. Almost every
+ * output sample is an original sample.
  *
- * Operates on interleaved stereo; the search runs on the summed channels so both
- * stay locked together.
+ * The stretcher before this crossfaded continuously: every output sample was a
+ * blend of two copies of the song a few milliseconds apart, spliced afresh 86
+ * times a second, which comb-filters the sound slightly and was heard as a small
+ * loss of clarity whenever a track was slowed down. Its search also compared
+ * only 11 ms over a 6 ms range with an unnormalised product, so loud passages
+ * beat well-matched ones and the bass could not be kept in phase.
+ *
+ * Operates on interleaved stereo with both channels in the match, so neither
+ * side drifts. Buffers are kept and reused, so the playback thread makes no
+ * garbage.
  */
-class TimeStretcher {
+class TimeStretcher(private val sampleRate: Int = 44_100) {
 
     @Volatile
     var factor: Float = 1f      // >1 plays faster
 
-    private val window = 2048   // frames
-    private val synthesisHop = window / 4
-    private val searchRadius = 256
+    private val overlap = frames(12.0)
 
-    private var pending = FloatArray(0)   // interleaved stereo residue
-    private var tail = FloatArray(window * 2)
+    /** Input not yet consumed, interleaved stereo, and how much of it is valid. */
+    private var pending = FloatArray(0)
+    private var pendingLength = 0
+    private var output = FloatArray(0)
+
+    /** The last [overlap] frames of the previous sequence, to crossfade from. */
+    private val previous = FloatArray(overlap * 2)
     private var primed = false
+    private var skipCarry = 0.0
 
-    private val fade = FloatArray(window) { i ->
-        (0.5 - 0.5 * cos(2.0 * PI * i / (window - 1))).toFloat()
+    /** Rises from 0 to 1 across the crossfade; with 1 - w it always sums to 1. */
+    private val fade = FloatArray(overlap) { i ->
+        (0.5 - 0.5 * cos(PI * (i + 0.5) / overlap)).toFloat()
     }
 
+    private fun frames(ms: Double) = (sampleRate * ms / 1000.0).toInt()
+
+    /** 100 ms sequences at half speed down to 45 ms at double, as SoundTouch scales them. */
+    private fun sequenceFrames(f: Float) = frames(100.0 - (f.coerceIn(0.5f, 2f) - 0.5) / 1.5 * 55.0)
+
+    /** How far each join may move to find its match: 22 ms at half speed, 15 ms at double. */
+    private fun seekFrames(f: Float) = frames(22.0 - (f.coerceIn(0.5f, 2f) - 0.5) / 1.5 * 7.0)
+
     fun reset() {
-        pending = FloatArray(0)
-        tail = FloatArray(window * 2)
+        pendingLength = 0
         primed = false
+        skipCarry = 0.0
+        previous.fill(0f)
     }
 
     fun process(input: FloatArray): FloatArray {
         val f = factor
-        if (f in 0.999f..1.001f) return input
+        if (f in 0.999f..1.001f) {
+            // Leftovers from an earlier speed would be spliced into the next
+            // time a speed is set; start that from clean instead.
+            if (primed || pendingLength > 0) reset()
+            return input
+        }
 
-        pending = pending + input
-        val analysisHop = (synthesisHop * f).toInt().coerceAtLeast(1)
-        val out = ArrayList<Float>(input.size)
+        if (pending.size < pendingLength + input.size) {
+            pending = pending.copyOf(maxOf(pendingLength + input.size, pending.size * 2))
+        }
+        System.arraycopy(input, 0, pending, pendingLength, input.size)
+        pendingLength += input.size
 
+        val sequence = sequenceFrames(f)
+        val seek = seekFrames(f)
+        val body = sequence - 2 * overlap
+        val advance = f * (sequence - overlap)
+
+        var written = 0
         var read = 0
-        while (true) {
-            val need = (read + searchRadius + window) * 2
-            if (need > pending.size) break
+        while ((read + seek + sequence) * 2 <= pendingLength) {
+            val start = read + if (primed) bestOffset(read, seek) else 0
+            val needed = written + (sequence - overlap) * 2
+            if (output.size < needed) output = output.copyOf(maxOf(needed, output.size * 2))
 
-            val offset = if (primed) bestOffset(read) else 0
-            val start = (read + offset).coerceAtLeast(0)
-            if ((start + window) * 2 > pending.size) break
-
-            // Overlap-add the new window against the previous one's tail.
-            for (i in 0 until synthesisHop) {
-                val w = fade[i]
-                out.add(tail[i * 2] * (1f - w) + pending[(start + i) * 2] * w)
-                out.add(tail[i * 2 + 1] * (1f - w) + pending[(start + i) * 2 + 1] * w)
+            // Crossfade from the end of the previous sequence into this one.
+            for (i in 0 until overlap) {
+                val w = if (primed) fade[i] else 1f
+                val at = (start + i) * 2
+                output[written++] = previous[i * 2] * (1f - w) + pending[at] * w
+                output[written++] = previous[i * 2 + 1] * (1f - w) + pending[at + 1] * w
             }
-            // Keep the remainder as the next overlap source.
-            for (i in 0 until window - synthesisHop) {
-                val src = (start + synthesisHop + i) * 2
-                if (src + 1 >= pending.size) break
-                tail[i * 2] = pending[src]
-                tail[i * 2 + 1] = pending[src + 1]
-            }
+            // The middle goes through untouched.
+            System.arraycopy(pending, (start + overlap) * 2, output, written, body * 2)
+            written += body * 2
+            // Its last stretch is held back, to fade from next time.
+            System.arraycopy(pending, (start + sequence - overlap) * 2, previous, 0, overlap * 2)
             primed = true
-            read += analysisHop
+
+            skipCarry += advance
+            val skip = skipCarry.toInt()
+            skipCarry -= skip
+            read += skip
         }
 
         if (read > 0) {
-            val keepFrom = (read * 2).coerceAtMost(pending.size)
-            pending = pending.copyOfRange(keepFrom, pending.size)
+            val keepFrom = (read * 2).coerceAtMost(pendingLength)
+            System.arraycopy(pending, keepFrom, pending, 0, pendingLength - keepFrom)
+            pendingLength -= keepFrom
         }
-        return FloatArray(out.size) { out[it] }
+        return output.copyOf(written)
     }
 
-    /** Offset within the search window whose waveform best matches the tail. */
-    private fun bestOffset(read: Int): Int {
+    /**
+     * Where, within [seek] frames of [read], the next sequence's opening best
+     * continues the end of the previous one: every fourth offset first, then
+     * each frame around the best of those.
+     */
+    private fun bestOffset(read: Int, seek: Int): Int {
         var best = 0
-        var bestScore = -Float.MAX_VALUE
-        val compare = minOf(synthesisHop, 512)
-
-        var offset = -searchRadius
-        while (offset <= searchRadius) {
-            val start = read + offset
-            if (start < 0 || (start + compare) * 2 > pending.size) {
-                offset += 32
-                continue
-            }
-            var score = 0f
-            var i = 0
-            while (i < compare) {
-                // Summed channels: keeps left and right from drifting apart.
-                val a = tail[i * 2] + tail[i * 2 + 1]
-                val b = pending[(start + i) * 2] + pending[(start + i) * 2 + 1]
-                score += a * b
-                i += 4          // sparse sampling; full correlation is wasted here
-            }
+        var bestScore = Double.NEGATIVE_INFINITY
+        var offset = 0
+        while (offset < seek) {
+            val score = similarity(read + offset)
             if (score > bestScore) {
                 bestScore = score
                 best = offset
             }
-            offset += 32
+            offset += 4
+        }
+        val coarse = best
+        for (fine in (coarse - 3)..(coarse + 3)) {
+            if (fine == coarse || fine < 0 || fine >= seek) continue
+            val score = similarity(read + fine)
+            if (score > bestScore) {
+                bestScore = score
+                best = fine
+            }
         }
         return best
+    }
+
+    /**
+     * Correlation of the held-back end with the input at [start], both channels,
+     * normalised by the input's energy so a loud stretch doesn't win over a
+     * matching one.
+     */
+    private fun similarity(start: Int): Double {
+        var correlation = 0.0
+        var energy = 0.0
+        val from = start * 2
+        for (i in 0 until overlap * 2) {
+            val sample = pending[from + i].toDouble()
+            correlation += previous[i] * sample
+            energy += sample * sample
+        }
+        return correlation / sqrt(energy + 1e-12)
     }
 }
 
@@ -203,6 +259,108 @@ class Reverb {
 }
 
 /**
+ * Ten-band graphic equalizer: peaking filters an octave apart from 31 Hz to
+ * 16 kHz, +-12 dB each.
+ *
+ * Gains arrive from the UI thread and are picked up at the start of the next
+ * buffer, where the filters are redesigned; their memory is kept, so moving a
+ * band while music plays doesn't click. A band at 0 dB is skipped. Boosts can
+ * push peaks past full scale, so anything above the knee eases into a soft
+ * ceiling instead of clipping hard.
+ */
+class Equalizer(private val sampleRate: Double = 44_100.0) {
+
+    @Volatile
+    var enabled: Boolean = false
+
+    private val incoming = AtomicReference<FloatArray?>(null)
+    private var gains = FloatArray(BANDS.size)
+    private val b0 = DoubleArray(BANDS.size)
+    private val b1 = DoubleArray(BANDS.size)
+    private val b2 = DoubleArray(BANDS.size)
+    private val a1 = DoubleArray(BANDS.size)
+    private val a2 = DoubleArray(BANDS.size)
+
+    // Transposed direct form II state: two values per band per channel.
+    private val z1 = DoubleArray(BANDS.size * 2)
+    private val z2 = DoubleArray(BANDS.size * 2)
+
+    init {
+        design()
+    }
+
+    fun setGains(db: List<Float>) {
+        incoming.set(FloatArray(BANDS.size) { db.getOrElse(it) { 0f }.coerceIn(-12f, 12f) })
+    }
+
+    fun reset() {
+        z1.fill(0.0)
+        z2.fill(0.0)
+    }
+
+    fun process(buffer: FloatArray) {
+        incoming.getAndSet(null)?.let {
+            gains = it
+            design()
+        }
+        if (!enabled) return
+        var boosted = false
+        for (band in BANDS.indices) {
+            if (abs(gains[band]) < 0.05f) continue
+            if (gains[band] > 0f) boosted = true
+            val c0 = b0[band]
+            val c1 = b1[band]
+            val c2 = b2[band]
+            val d1 = a1[band]
+            val d2 = a2[band]
+            var i = 0
+            while (i + 1 < buffer.size) {
+                for (channel in 0..1) {
+                    val k = band * 2 + channel
+                    val x = buffer[i + channel].toDouble()
+                    val y = c0 * x + z1[k]
+                    z1[k] = c1 * x - d1 * y + z2[k]
+                    z2[k] = c2 * x - d2 * y
+                    buffer[i + channel] = y.toFloat()
+                }
+                i += 2
+            }
+        }
+        if (boosted) {
+            for (i in buffer.indices) {
+                val x = buffer[i]
+                val magnitude = abs(x)
+                if (magnitude > KNEE) {
+                    buffer[i] = sign(x) * (KNEE + (1f - KNEE) * tanh((magnitude - KNEE) / (1f - KNEE)))
+                }
+            }
+        }
+    }
+
+    /** RBJ cookbook peaking filters. */
+    private fun design() {
+        for (band in BANDS.indices) {
+            val amplitude = 10.0.pow(gains[band] / 40.0)
+            val w0 = 2.0 * PI * BANDS[band] / sampleRate
+            val alpha = sin(w0) / (2.0 * Q)
+            val cosine = cos(w0)
+            val a0 = 1.0 + alpha / amplitude
+            b0[band] = (1.0 + alpha * amplitude) / a0
+            b1[band] = -2.0 * cosine / a0
+            b2[band] = (1.0 - alpha * amplitude) / a0
+            a1[band] = -2.0 * cosine / a0
+            a2[band] = (1.0 - alpha / amplitude) / a0
+        }
+    }
+
+    companion object {
+        val BANDS = doubleArrayOf(31.0, 62.0, 125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0, 16_000.0)
+        private const val Q = 1.41
+        private const val KNEE = 0.9f
+    }
+}
+
+/**
  * Speed, pitch and reverb, composed the same way as the Android build: three
  * independent axes that stack.
  *
@@ -214,6 +372,15 @@ class EffectChain {
 
     val stretcher = TimeStretcher()
     val reverb = Reverb()
+    val equalizer = Equalizer()
+
+    /**
+     * Continuous across buffers. The pitch shift used to resample each buffer on
+     * its own with the fingerprinting filter, which was both slow and seamed at
+     * every buffer boundary.
+     */
+    private val pitchResampler = StreamingResampler(2)
+    private var pitchActive = false
 
     @Volatile
     var speed: Float = 1f
@@ -227,6 +394,9 @@ class EffectChain {
     fun reset() {
         stretcher.reset()
         reverb.reset()
+        equalizer.reset()
+        pitchResampler.reset()
+        pitchActive = false
     }
 
     fun process(input: FloatArray): FloatArray {
@@ -234,29 +404,24 @@ class EffectChain {
         var buffer = input
 
         if (pitch !in 0.999f..1.001f) {
-            buffer = resampleStereo(buffer, pitch)
+            // History from an earlier stretch of pitched audio is stale by now.
+            if (!pitchActive) {
+                pitchResampler.reset()
+                pitchActive = true
+            }
+            buffer = pitchResampler.process(buffer, buffer.size / 2, pitch.toDouble())
+        } else {
+            pitchActive = false
         }
         stretcher.factor = speed / pitch
         buffer = stretcher.process(buffer)
 
+        equalizer.process(buffer)
         reverb.process(buffer)
 
         if (volume !in 0.999f..1.001f) {
             for (i in buffer.indices) buffer[i] *= volume
         }
         return buffer
-    }
-
-    /** Resamples each channel independently, then re-interleaves. */
-    private fun resampleStereo(input: FloatArray, ratio: Float): FloatArray {
-        val frames = input.size / 2
-        val left = FloatArray(frames) { input[it * 2] }
-        val right = FloatArray(frames) { input[it * 2 + 1] }
-        val rate = AudioDevices.FORMAT.sampleRate.toInt()
-        val target = (rate / ratio).toInt().coerceAtLeast(8000)
-        val outL = Dsp.resample(left, rate, target)
-        val outR = Dsp.resample(right, rate, target)
-        val n = minOf(outL.size, outR.size)
-        return FloatArray(n * 2) { if (it % 2 == 0) outL[it / 2] else outR[it / 2] }
     }
 }
